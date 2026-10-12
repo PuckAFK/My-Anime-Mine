@@ -3,6 +3,7 @@
 -- Integrated stock-aware smart pickaxe buying and equipped-miner optimization.
 -- v2.1: immediate chest-to-seller cash-out when ore funds required research or a zone unlock.
 -- v2.3: simple first-run PuckUI, default-on safe progression, quick presets, live status; advanced controls separated.
+-- v2.4: protect strong/equipped miners while selling weak bag/chest spares; strict research -> zone -> optional spending.
 -- Uses PuckUI via its canonical URL; never initiates Robux purchases.
 -- Game-server interactions are subject to live-game availability and verification.
 
@@ -45,6 +46,9 @@ local defaults = {
     Mine = true,
     AutoChest = true,
     AutoSellOre = true,
+    AutoSellMiners = true, -- sells genuinely weak unassigned MINERS; never haulers or valuable protected units
+    MinerKeepBestSpare = 2, -- keep the two strongest unassigned miner stacks as backups
+    MinerSellStrength = 0.85, -- only sell miners below 85% of the weakest equipped miner's base strength
     AutoCashoutProgression = true, -- auto collect chest ore and sell once it can fund next research/zone
     EquipBest = true,
     AutoSkills = true,
@@ -144,6 +148,8 @@ local state = {
     cashoutStatus = "Waiting for sellable chest ore", cashoutGoal = "None",
     cashoutChestWorth = 0, cashoutInventoryWorth = 0,
     cashoutChestCollections = 0, cashoutSells = 0, lastCashoutAt = -100,
+    minersSold = 0, minerSaleRevenue = 0, minerSellStatus = "Waiting for crew data",
+    minerSellCandidates = 0, lastMinerSale = -100,
     lastSpend = -100, lastSpin = -100, lastSummon = -100,
     lastQuest = -100, lastZone = -100, lastPickaxe = -100,
     lastHome = -100, lastTravel = -100, lastScan = 0,
@@ -313,19 +319,19 @@ local function liveTeamPower(mg)
     return math.max(0, tonumber(Player:GetAttribute("MinePower")) or 0)
 end
 
+-- Mandatory research is fully funded BEFORE optional upgrades. When the next
+-- gate is complete, save ALL money for the zone. The sole exception is a capped
+-- team-power rescue when every reachable required research pip is power-locked.
 local function affordable(data, cost, spendingKind)
     cost = tonumber(cost)
-    if not cost or cost <= 0 or cost == math.huge then return false end
+    if not cost or cost <= 0 or cost == math.huge or cost ~= cost then return false end
     local cash = moneyAvailable(data)
-    if config.AutoBuyZones and config.AutoCompleteResearch then
+    if config.AutoCompleteResearch then
         local mg = data and data.MineGame
         local nextKey = nextZoneFromSave(mg)
         if nextKey then
             local _, _, _, ready = zoneResearchStatus(mg, nextKey)
             if not ready then
-                -- A power-locked research node cannot be solved by buying more
-                -- research: we must first improve EQUIPPED team damage.
-                -- Only power-increasing purchases may use this narrow budget.
                 if spendingKind == "TeamPower" and config.PowerGateRescue
                     and state.rescueActive then
                     local minKeep = math.clamp(config.PowerRescueKeepCash, 0, 0.90)
@@ -333,7 +339,10 @@ local function affordable(data, cost, spendingKind)
                     return cash >= cost and cost <= cash * maxSingle
                         and cash - cost >= cash * minKeep
                 end
-                return false
+                return false -- even tiny nonessential purchases would delay research
+            end
+            if config.AutoBuyZones then
+                return false -- buy the researched zone BEFORE optional upgrades
             end
         end
     end
@@ -341,21 +350,9 @@ local function affordable(data, cost, spendingKind)
         local mg = data and data.MineGame
         local nextKey, zoneCost = nextZoneFromSave(mg)
         local _, _, _, researchReady = zoneResearchStatus(mg, nextKey)
-        if nextKey and researchReady and zoneCost and cash >= zoneCost * math.clamp(config.ZoneSaveAt, 0.05, 0.95) then
-            -- Save aggressively near the unlock, but don't trap new players with
-            -- weak miners at only 30% of an expensive next-zone price.
-            if not config.SmartUpgradeSavings or cash >= zoneCost * 0.83 then
-                return false
-            end
-            local current = mg and MineConfig.Zones and MineConfig.Zones[mg.CurrentZone or "Z1"]
-            local baseHp = current and tonumber(current.NodeBaseHealth) or nil
-            local power = math.max(1, tonumber((mg.Stats or {}).TotalPower) or 0)
-            -- A weak setup may invest only a small portion of saved cash.
-            -- More expensive upgrades wait for the next zone unlock.
-            if not (baseHp and baseHp > 0 and (power < baseHp / 18)
-                and cost <= cash * 0.055) then
-                return false
-            end
+        if nextKey and researchReady and zoneCost
+            and cash >= zoneCost * math.clamp(config.ZoneSaveAt, 0.05, 0.95) then
+            return false
         end
     end
     return cash >= cost and cost <= cash * math.clamp(config.BudgetPercent, 0.05, 0.95)
@@ -1208,31 +1205,145 @@ local function sellableOre(mg)
     end
     return keys, worth
 end
+-- The seller accepts stack keys for BOTH ores and miners via MineSellItems.
+-- Unlike blindly selling every Character key, this plan protects assigned crew,
+-- all haulers, special unsellable rarities, and the best unassigned backups.
+-- It also examines chest loot so research cashouts can use safe miner sale value.
+local function minerSalePlan(mg, chestEntries)
+    local plan = {Keys = {}, BagWorth = 0, ChestWorth = 0, Stacks = 0}
+    if not config.AutoSellMiners or type(mg) ~= "table" then return plan end
+    local holders = type(mg.Holders) == "table" and mg.Holders or {}
+    local assignedNames = {}
+    local assigned = 0
+    local weakest = math.huge
+    for holderKey, holder in pairs(holders) do
+        if type(holder) == "table" and type(holder.CharName) == "string" then
+            local ok, item = pcall(Items.GetItemData, holder.CharName)
+            if ok and type(item) == "table" and item.Type == "Character" then
+                assignedNames[holder.CharName] = true -- protects every equipped stack/variant
+                if item.MineRole ~= "Hauler" then
+                    assigned += 1
+                    local good, base = pcall(MineConfig.GetHolderBaseDamage, holder, item)
+                    local levelOK, level = pcall(MineConfig.GetHolderLevel, holder)
+                    local variantOK, variantMult = pcall(MineConfig.GetHolderVariantMult, holder)
+                    local miningOK, miningSpeed = pcall(MineConfig.GetHolderMineSpeed, holder)
+                    if good and levelOK and variantOK and miningOK then
+                        local multiplyOK, levelMult = pcall(MineConfig.GetCharacterLevelMultiplier, level)
+                        if multiplyOK then
+                            local power = (tonumber(base) or 0) * (tonumber(levelMult) or 1)
+                                * (tonumber(variantMult) or 1) * (tonumber(miningSpeed) or 1)
+                            if power > 0 then weakest = math.min(weakest, power) end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Never liquidate miners to fill an incomplete team. Under this condition
+    -- all unassigned miners may still be needed on spare pads.
+    local slotCount = tonumber(mg.MinerSlots) or assigned
+    if assigned == 0 or assigned < slotCount or weakest == math.huge then
+        state.minerSellStatus = "Waiting for fully assigned mining crew"
+        return plan
+    end
+    -- Wait briefly after the game's Equip Best action, so new drops are assigned
+    -- before any evaluation. No extra equip/unequip server calls are made here.
+    if config.EquipBest and os.clock() - state.lastEquip < 5.5 then
+        state.minerSellStatus = "Giving Equip Best time to settle"
+        return plan
+    end
+    local all = {}
+    local function add(entries, inChest)
+        for _, entry in ipairs(entries or {}) do
+            if type(entry) == "table" and entry.Kind == "Character"
+                and entry.Role == "Miner" and type(entry.Key) == "string"
+                and not assignedNames[entry.Name] and (tonumber(entry.Count) or 0) > 0
+                and (tonumber(entry.Worth) or 0) > 0 then
+                local ok, item = pcall(Items.GetItemData, entry.Name)
+                if ok and type(item) == "table" and item.Type == "Character"
+                    and item.MineRole ~= "Hauler" and MineConfig.CanSellCharacter(item) then
+                    local good, damage = pcall(MineConfig.GetCharacterDamage, item)
+                    local lvlOK, lvl = pcall(MineConfig.GetCharacterLevelMultiplier, entry.Level or 1)
+                    local variantOK, variant = pcall(MineConfig.GetVariantMult, entry.Variant)
+                    local speedOK, speed = pcall(MineConfig.GetCharacterMineSpeed, entry.MineSpeedLevel or 1)
+                    local power = (good and tonumber(damage) or 0)
+                        * (lvlOK and tonumber(lvl) or 1)
+                        * (variantOK and tonumber(variant) or 1)
+                        * (speedOK and tonumber(speed) or 1)
+                    if power > 0 and power == power then
+                        local record = all[entry.Key]
+                        if not record then
+                            record = {Key = entry.Key, Power = power, BagWorth = 0, ChestWorth = 0}
+                            all[entry.Key] = record
+                        end
+                        if inChest then record.ChestWorth += tonumber(entry.Worth) or 0
+                        else record.BagWorth += tonumber(entry.Worth) or 0 end
+                    end
+                end
+            end
+        end
+    end
+    local ok, bag = pcall(MineInventory.Collect, mg, "All", MineInventory.KindOrder.Default)
+    if not ok or type(bag) ~= "table" then return plan end
+    add(bag, false)
+    add(chestEntries, true)
+    local ranked = {}
+    for _, entry in pairs(all) do ranked[#ranked + 1] = entry end
+    table.sort(ranked, function(a,b)
+        if a.Power ~= b.Power then return a.Power > b.Power end
+        return a.Key < b.Key
+    end)
+    -- Protect entire stacks, never attempt to sell a portion of a stack: the
+    -- game's Sell event accepts keys and normally sells their entire count.
+    local keep = math.clamp(math.floor(tonumber(config.MinerKeepBestSpare) or 2), 0, 10)
+    local threshold = weakest * math.clamp(tonumber(config.MinerSellStrength) or 0.85, 0.1, 1)
+    for i, entry in ipairs(ranked) do
+        if i > keep and entry.Power < threshold then
+            if entry.BagWorth > 0 then
+                plan.Keys[#plan.Keys + 1] = entry.Key
+                plan.BagWorth += entry.BagWorth
+                plan.Stacks += 1
+            end
+            plan.ChestWorth += entry.ChestWorth
+        end
+    end
+    state.minerSellCandidates = plan.Stacks
+    state.minerSellStatus = string.format("%d weak spare stacks | worth %.3g on hand + %.3g in chest",
+        plan.Stacks, plan.BagWorth, plan.ChestWorth)
+    return plan
+end
+
+local function sellableCargo(mg, chestEntries)
+    local keys, worth, oreWorth = {}, 0, 0
+    if config.AutoSellOre then
+        local oreKeys, oreValue = sellableOre(mg)
+        for _, key in ipairs(oreKeys) do keys[#keys + 1] = key end
+        worth = oreValue
+        oreWorth = oreValue
+    end
+    local miners = minerSalePlan(mg, chestEntries)
+    for _, key in ipairs(miners.Keys) do keys[#keys + 1] = key end
+    return keys, worth + miners.BagWorth, oreWorth, miners
+end
+
 local function sellOre(mg, epoch, force)
-    -- Required-progression funding ignores the ordinary seller-trip cooldown,
-    -- but retains a short anti-spam guard if navigation or the server fails.
-    if not config.AutoSellOre or os.clock() - state.lastSellAttempt < (force and 5 or 30) then return false end
-    local keys, worth = sellableOre(mg)
-    if #keys == 0 then return false end
+    -- Includes safe weak miner stacks as well as ore; limits repeated seller
+    -- journeys and preserves the existing immediate progression cashout policy.
+    if not (config.AutoSellOre or config.AutoSellMiners)
+        or os.clock() - state.lastSellAttempt < (force and 5 or 30) then return false end
+    local keys, worth, oreWorth, miners = sellableCargo(mg, getChestEntries(mg))
+    if #keys == 0 or worth <= 0 then return false end
     local cash = moneyAvailable(select(1, getMine()))
     local researchReady = config.AutoCompleteResearch and state.researchTotal > state.researchCurrent
         and state.researchNextCost > cash and cash + worth >= state.researchNextCost
     if not force and not researchReady and worth < math.max(config.MinSellValue, cash * 0.012)
         and os.clock() - state.lastSell < 150 then return false end
     if config.EfficientTrips and not force then
-        local _,fresh = getMine()
+        local _, fresh = getMine()
         local zoneKey, zoneCost = nextZoneFromSave(fresh or mg)
-        -- Sell immediately when the ore itself funds an unlocked cash zone.
         local _, _, _, gateComplete = zoneResearchStatus(fresh or mg, zoneKey)
-        local zoneReady = zoneKey and gateComplete and zoneCost and cash < zoneCost and cash + worth >= zoneCost
-        -- Don't save a journey if liquidating ore immediately pays for an
-        -- important mining-damage upgrade; that would slow progression.
-        local tapDef = MineConfig.CoreUpgradeById and MineConfig.CoreUpgradeById.Tap
-        local tapLevel = tonumber((fresh or mg).TapLevel) or 1
-        local tapCost = config.AutoTapUpgrades and tapDef and tapLevel < tapDef.Max
-            and tapDef.Cost(tapLevel) or nil
-        local tapReady = tapCost and cash < tapCost and cash + worth >= tapCost
-        -- If chest needs collecting soon, batch one seller trip with that trip.
+        local zoneReady = zoneKey and gateComplete and zoneCost and cash < zoneCost
+            and cash + worth >= zoneCost
         local chestEntries = getChestEntries(fresh or mg)
         local capacity = tonumber(MineConfig.GetChestCapacityFor(fresh or mg, 0)) or 0
         local chestCount = totalChestCount(chestEntries)
@@ -1240,37 +1351,64 @@ local function sellOre(mg, epoch, force)
         local enoughCashValue = worth >= math.max(config.MinSellValue, cash * 0.055)
         local maxWaitReached = os.clock() - state.lastSell > 165
         local recentTrip = os.clock() - state.lastActualSell < (config.FasterScheduling and 50 or 65)
-        if not researchReady and not zoneReady and not tapReady and not chestSoon and not maxWaitReached and (not enoughCashValue or recentTrip) then
-
-            return false
-        end
+        if not researchReady and not zoneReady and not chestSoon and not maxWaitReached
+            and (not enoughCashValue or recentTrip) then return false end
     end
     state.lastSellAttempt = os.clock()
-
     if config.NativeTravel then teleportGame("Hub", epoch) end
     local seller = findSeller()
     local pos = positionOf(seller)
-    if not pos then state.lastFailure="SellStand not loaded"; return false end
+    if not pos then state.lastFailure = "SellStand not loaded"; return false end
     local prompt = seller:FindFirstChild("SellPrompt", true)
     local reach = prompt and math.min(8.0, math.max(5.5, prompt.MaxActivationDistance)) or 8
     if not standAround(pos, reach, epoch, "Seller", seller) then
         state.lastFailure = "Seller navigation blocked"
         return false
     end
-    local sold = sendConfirmed("MineSellItems", function(freshData, fresh)
-        if not fresh then return false end
-        local _, newWorth = sellableOre(fresh)
-        -- New ore can be mined during the trip. Increasing money still confirms
-        -- a sale if new ore hid the inventory decrease.
-        return newWorth < worth or moneyAvailable(freshData) > cash
-    end, 3.2, keys)
+    -- Re-evaluate *after* travelling: the game may have equipped a new miner
+    -- during the journey. Never send a stale list of potentially strong units.
+    local freshData, fresh = getMine()
+    if not fresh then
+        if config.NativeTravel and travelValid(epoch) then teleportGame("Plot", epoch) end
+        return false
+    end
+    local finalKeys, finalWorth, _, finalMiners = sellableCargo(fresh, getChestEntries(fresh))
+    if #finalKeys == 0 then
+        if config.NativeTravel and travelValid(epoch) then teleportGame("Plot", epoch) end
+        return false
+    end
+    local priorCash = moneyAvailable(freshData)
+    local originalCounts = {}
+    for _, key in ipairs(finalMiners.Keys) do
+        originalCounts[key] = tonumber((fresh.Characters or {})[key]) or 0
+    end
+    local sold = sendConfirmed("MineSellItems", function(newData, newer)
+        if not newer then return false end
+        if moneyAvailable(newData) > priorCash then return true end
+        local _, remaining = sellableCargo(newer, getChestEntries(newer))
+        if remaining < finalWorth then return true end
+        for key, oldCount in pairs(originalCounts) do
+            if (tonumber((newer.Characters or {})[key]) or 0) < oldCount then return true end
+        end
+        return false
+    end, 3.2, finalKeys)
     if sold then
-
         state.lastSell = os.clock()
         state.lastActualSell = state.lastSell
+        local _, post = getMine()
+        if post then
+            for key, before in pairs(originalCounts) do
+                local actual = math.max(0, before - (tonumber((post.Characters or {})[key]) or 0))
+                state.minersSold += actual
+            end
+        end
+        if next(originalCounts) then
+            state.lastMinerSale = state.lastSell
+            state.minerSaleRevenue += finalMiners.BagWorth
+            state.minerSellStatus = string.format("Sold safe spare miners for about %.3g", finalMiners.BagWorth)
+        end
     end
     if config.NativeTravel and travelValid(epoch) then teleportGame("Plot", epoch) end
-
     return sold
 end
 
@@ -1414,9 +1552,9 @@ local function researchPlan(mg, zone)
 end
 
 -- IMPORTANT: sale value is item.Worth for the entire stack (not price per unit).
--- Only ore is counted/sold; collecting "Take All" still preserves miners and
--- other loot in inventory. MineInventory.ChestEntries applies current research
--- sell multipliers, matching the game's chest and inventory UI.
+-- Only genuinely sellable items count toward the funding goal: ore plus
+-- weak unassigned miner stacks after protecting the crew and best spares.
+-- MineInventory.ChestEntries supplies the game's current sell multipliers.
 local function chestOreWorth(entries)
     local worth = 0
     for _, entry in ipairs(entries or {}) do
@@ -1434,13 +1572,15 @@ end
 -- optional node or an unreleased zone. This runs at the movement scheduler,
 -- which can act without waiting for the usual chest-fill / sale thresholds.
 local function progressionCashoutPlan(data, mg, chestEntries)
-    if not config.AutoCashoutProgression or not config.AutoChest or not config.AutoSellOre
+    if not config.AutoCashoutProgression or not config.AutoChest
+        or not (config.AutoSellOre or config.AutoSellMiners)
         or not config.AutoBuyZones or type(mg) ~= "table" then return nil end
     local nextKey, zoneCost, zone = nextZoneFromSave(mg)
     if not nextKey then return nil end
     local cash = moneyAvailable(data)
-    local _, bagWorth = sellableOre(mg)
-    local chestWorth = chestOreWorth(chestEntries)
+    local _, bagWorth, _, saleMiners = sellableCargo(mg, chestEntries)
+    local chestWorth = (config.AutoSellOre and chestOreWorth(chestEntries) or 0)
+        + (saleMiners.ChestWorth or 0)
     state.cashoutInventoryWorth, state.cashoutChestWorth = bagWorth, chestWorth
     local available = cash + bagWorth + chestWorth
     if bagWorth <= 0 and chestWorth <= 0 then return nil end
@@ -1501,7 +1641,7 @@ local function progressionCashoutPlan(data, mg, chestEntries)
 end
 
 local function researchTick(data, mg)
-    if not config.AutoBuyZones or not config.AutoCompleteResearch then return false end
+    if not config.AutoCompleteResearch then return false end
     local nextKey = nextZoneFromSave(mg)
     if not nextKey then
         state.researchStatus = "No further currently available zone gate"
@@ -1567,7 +1707,10 @@ local function researchTick(data, mg)
         state.researchPowerWait = string.format("Team power %.3g / %.3g", minePower, minMissingPower or 0)
         -- Finish affordable, non-power-gated research first, then grow the
         -- team instead of indefinitely sitting on an impossible Density pip.
+        -- Cash-starved but *not* power-locked research must save for research;
+        -- power rescue can only spend once ALL currently open pips require power.
         state.rescueActive = config.PowerGateRescue and affordableCandidate == nil
+            and blockedPower == #candidates
         if state.rescueActive then
             state.rescueState = string.format("Improving team power %.3g / %.3g", minePower, minMissingPower)
         else
@@ -1848,9 +1991,13 @@ local function pickaxeTick(data, mg)
 
     local nextKey, zoneCost = nextZoneFromSave(mg)
     local _, _, _, researchReady = zoneResearchStatus(mg, nextKey)
-    if nextKey and config.AutoBuyZones and config.AutoCompleteResearch
+    if nextKey and config.AutoCompleteResearch
         and not researchReady and not rescue then
         state.pickaxeStatus = "Saving for required zone research"
+        return nil
+    end
+    if nextKey and researchReady and config.AutoBuyZones and config.AutoCompleteResearch then
+        state.pickaxeStatus = "Required research done; saving every coin for zone " .. nextKey
         return nil
     end
     -- Prefer the zone unlock once savings are substantial, except for a small,
@@ -2111,6 +2258,13 @@ local function characterLevelsTick(data, mg)
 end
 
 local function craftTick(data, mg)
+    if config.AutoCompleteResearch then
+        local nextKey = nextZoneFromSave(mg)
+        if nextKey then
+            local _, _, _, complete = zoneResearchStatus(mg, nextKey)
+            if not complete or config.AutoBuyZones then return nil end
+        end
+    end
     if not config.AutoCrafting or CraftingCatalog.Enabled ~= true
         or os.clock() - state.lastCraft < 40 then return nil end
     local candidates = CraftingCatalog.Recipes()
@@ -2707,7 +2861,8 @@ local function farmLoop()
         local chestCount = totalChestCount(entries)
         local chestFull = config.UrgentFullChest and plot:GetAttribute("MineChestFull") == true
         local goal = nil
-        if config.AutoCashoutProgression and config.AutoChest and config.AutoSellOre then
+        if config.AutoCashoutProgression and config.AutoChest
+            and (config.AutoSellOre or config.AutoSellMiners) then
             local planned, result = pcall(progressionCashoutPlan, data, mg, entries)
             if planned then
                 goal = result
@@ -2718,7 +2873,7 @@ local function farmLoop()
         local urgentChest = goal and goal.NeedChest
         if goal then
             state.cashoutGoal = goal.Name
-            state.cashoutStatus = string.format("%s: %.3g / %.3g cash; ore %.3g bag + %.3g chest",
+            state.cashoutStatus = string.format("%s: %.3g / %.3g cash; sellable %.3g bag + %.3g chest",
                 goal.Name, goal.Cash, goal.Cost, goal.BagWorth, goal.ChestWorth)
         else
             state.cashoutGoal = "None"
@@ -2734,7 +2889,7 @@ local function farmLoop()
             lastActionSucceeded = ok and result
             if lastActionSucceeded and urgentChest then
                 state.cashoutChestCollections += 1
-                state.cashoutStatus = "Collected chest for " .. goal.Name .. "; selling ore"
+                state.cashoutStatus = "Collected chest for " .. goal.Name .. "; selling eligible loot"
                 -- Chest and inventory replication is confirmed before selling;
                 -- collectChest uses the game's Take All, which also keeps miners.
                 task.wait(0.12)
@@ -2745,11 +2900,12 @@ local function farmLoop()
                 elseif sold then
                     state.cashoutSells += 1
                     state.lastCashoutAt = os.clock()
-                    state.cashoutStatus = "Sold chest ore for " .. goal.Name
+                    state.cashoutStatus = "Sold chest loot for " .. goal.Name
                 end
             end
         end
-        if not lastActionSucceeded and config.AutoSellOre and not (urgentChest and chestCount > 0) then
+        if not lastActionSucceeded and (config.AutoSellOre or config.AutoSellMiners)
+            and not (urgentChest and chestCount > 0) then
             -- Wait for the chest if its ore is REQUIRED for this purchase;
             -- selling a smaller partial bag first wastes a seller journey.
             -- If bagged ore ALREADY pays for the goal, visit the seller first.
@@ -2760,7 +2916,7 @@ local function farmLoop()
             if lastActionSucceeded and urgentSell then
                 state.cashoutSells += 1
                 state.lastCashoutAt = os.clock()
-                state.cashoutStatus = "Sold carried ore for " .. goal.Name
+                state.cashoutStatus = "Sold eligible items for " .. goal.Name
             end
         end
         if not lastActionSucceeded then
@@ -2924,6 +3080,9 @@ local migratedTabForKey = {
     ['AutoPotions'] = 'Rewards',
     ['AutoQuests'] = 'Rewards',
     ['AutoSellOre'] = 'Home',
+    ['AutoSellMiners'] = 'Home',
+    ['MinerKeepBestSpare'] = 'Advanced',
+    ['MinerSellStrength'] = 'Advanced',
     ['AutoSkills'] = 'Upgrades',
     ['AutoSlots'] = 'Upgrades',
     ['AutoSpin'] = 'Rewards',
@@ -3097,7 +3256,7 @@ end
 -- Purchases of Robux items never become enabled; crafting, trial running and
 -- experimental crew focus remain opt-in. Potions/scrolls consume spare inventory.
 local recommended = {
-    Mine = true, AutoChest = true, AutoSellOre = true,
+    Mine = true, AutoChest = true, AutoSellOre = true, AutoSellMiners = true,
     AutoCashoutProgression = true, EquipBest = true,
     AutoSkills = true, AutoCompleteResearch = true,
     AutoTapUpgrades = true, AutoSlots = true,
@@ -3139,6 +3298,7 @@ homeTab:CreateSection("Everyday Automation")
 toggle(homeTab, "Mine Rocks", "Mine")
 toggle(homeTab, "Collect Ore Chests", "AutoChest")
 toggle(homeTab, "Sell Ores Automatically", "AutoSellOre")
+toggle(homeTab, "Sell Weak Spare Miners", "AutoSellMiners")
 toggle(homeTab, "Cash Out for Research / Zones", "AutoCashoutProgression")
 homeTab:CreateSection("Recommended Setup")
 homeTab:CreateButton({Name = "Enable All Recommended Features", Callback = function()
@@ -3175,6 +3335,7 @@ homeTab:CreateLabel("Detailed controls: Upgrades, Rewards, Advanced.")
 -- UPGRADES: straightforward defaults for the recurring money and power loop.
 upgradeTab:CreateSection("Research & Zones")
 toggle(upgradeTab, "Complete Required Research", "AutoCompleteResearch")
+upgradeTab:CreateLabel("Required research first; then unlock the zone. Optional upgrades wait.")
 toggle(upgradeTab, "Unlock Next Zone", "AutoBuyZones")
 toggle(upgradeTab, "Mine Best Unlocked Zone", "AutoZone")
 toggle(upgradeTab, "Save Money for Next Zone", "ZoneSaveForNext")
@@ -3257,6 +3418,9 @@ slider(advancedTab, "Maximum Hits per Rock", "MaxTapsPerRock", 8, 100, 1)
 slider(advancedTab, "Click Interval (game-limited)", "TapInterval", 1.2, 3.0, 0.1)
 slider(advancedTab, "Colossus Time Limit (sec)", "ColossusMaxSeconds", 15, 180, 5)
 advancedTab:CreateSection("Chest & Selling")
+slider(advancedTab, "Keep Best Spare Miner Stacks", "MinerKeepBestSpare", 0, 10, 1)
+slider(advancedTab, "Sell Miners Below Crew Power (%)", "MinerSellStrength", 10, 100, 5, percent)
+advancedTab:CreateLabel("Protects assigned crew, haulers, unsellable rarities and strongest backups.")
 toggle(advancedTab, "Avoid Unnecessary Seller Trips", "EfficientTrips")
 toggle(advancedTab, "Empty a Full Chest Immediately", "UrgentFullChest")
 slider(advancedTab, "Collect Chest When Full (%)", "ChestPercent", 20, 95, 5, percent)
@@ -3276,6 +3440,7 @@ slider(advancedTab, "Pickaxe Money Reserve (%)", "PickaxeReservePercent", 0, 80,
 slider(advancedTab, "Minimum Team Power Gain (%)", "PickaxeMinTeamGain", 0, 20, 1, percent)
 advancedTab:CreateSection("Zone & Research Priorities")
 toggle(advancedTab, "Prioritise Affordable Research", "SmartResearchPriority")
+advancedTab:CreateLabel("Hard priority: required research > next zone > ordinary upgrades.")
 toggle(advancedTab, "Respect Research Power Requirements", "PowerAwareResearch")
 toggle(advancedTab, "Buy Pickaxes to Unblock Research", "PowerRescuePickaxes")
 toggle(advancedTab, "Level Miners to Unblock Research", "PowerRescueLevels")

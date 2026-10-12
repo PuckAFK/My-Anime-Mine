@@ -45,7 +45,10 @@ local defaults = {
     AutoSlots = true,
     AutoCharacterLevels = true,
     AutoCrafting = false,
-    AutoPickaxes = false,
+    AutoPickaxes = true,
+    SmartPickaxeProgression = true,
+    PickaxeMaxCashShare = 0.72,
+    PickaxeCashReserve = 0.12,
     AutoEquipOwnedPickaxes = true,
     EnableOwnedAutoSell = false,
     AutoFocusSpecial = false,
@@ -88,8 +91,8 @@ local defaults = {
     PowerGateRescue = true,
     PowerRescuePickaxes = true,
     PowerRescueLevels = true,
-    PowerRescueMaxPurchase = 0.22,
-    PowerRescueKeepCash = 0.40,
+    PowerRescueMaxPurchase = 0.72,
+    PowerRescueKeepCash = 0.12,
     CancelDeadRockWalk = true,
     AdaptiveRockChoice = true,
     ResearchCashBoost = true,
@@ -145,6 +148,8 @@ local state = {
     researchZone = "Z1", researchNextCost = 0, researchNextName = "None",
     researchStatus = "Checking research", researchBuys = 0,
     researchBlocked = "", researchLast = -100, researchResolved = {},
+    pickaxeStatus = "Checking pickaxe upgrades", pickaxeBuys = 0,
+    missingDataAt = 0, missingDataWarnAt = -100,
     lastZoneBuy = -100,
     lastSuccess = "None", lastFailure = "None",
     lastAction = "None", weather = "Clear", event = "None", special = "None",
@@ -170,9 +175,42 @@ local state = {
     nodeAttempts = setmetatable({}, {__mode = "k"}),
     connections = {},
 }
+-- Normal executors share the game's hydrated module state. Some limited
+-- executors require an isolated module whose Players cache is empty.
+-- Check supported module access paths but NEVER synthesize a fake player
+-- profile or send blind purchases without authoritative current state.
 local function getData()
     local ok, data = pcall(GameState.GetData2)
-    return ok and type(data) == "table" and data or nil
+    if ok and type(data) == "table" and type(data.MineGame) == "table" then
+        state.missingDataAt = 0
+        return data
+    end
+    local id = tostring(Player.UserId)
+    local candidate = type(GameState.Players) == "table" and GameState.Players[id] or nil
+    data = type(candidate) == "table" and candidate.Data or nil
+    if type(data) ~= "table" then
+        ok, data = pcall(GameState.IsDataAvailable, Player.UserId)
+    end
+    if type(data) ~= "table" then
+        ok, data = pcall(GameState.GetData, GameState)
+    end
+    if type(data) == "table" and type(data.MineGame) == "table" then
+        state.missingDataAt = 0
+        return data
+    end
+    if state.missingDataAt == 0 then state.missingDataAt = os.clock() end
+    if config.Master and os.clock() - state.missingDataAt > 6 then
+        state.researchStatus = "Player data unavailable - executor module isolation"
+        state.researchBlocked = "GameState.GetData2 has no MineGame; purchases paused"
+        state.zoneWait = state.researchBlocked
+        if os.clock() - state.missingDataWarnAt > 25 then
+            state.missingDataWarnAt = os.clock()
+            state.lastFailure = "Executor compatibility: live GameState data unavailable"
+            warn("[PuckAFK Mine] Client data unavailable: this executor may isolate require(GameState). " ..
+                "Research, pickaxes and zone purchases paused; no safe verified state bridge found.")
+        end
+    end
+    return nil
 end
 local function getMine()
     local d = getData()
@@ -268,7 +306,8 @@ local function zoneResearchStatus(mg, nextKey)
     end
     local gate = MineConfig.ZoneResearchGateFor(nextKey)
     if not gate or not (MineConfig.Zones and MineConfig.Zones[gate]) then
-        return nil, 0, 0, true
+        -- Unknown / unloaded staged zone data is NOT evidence research is complete.
+        return nil, 0, 0, false
     end
     local skills = type(mg.Skills) == "table" and mg.Skills or {}
     local ok, earned, required = pcall(MineConfig.GetZoneResearchProgress, skills, gate)
@@ -1656,16 +1695,47 @@ end
 -- Pickaxes are multipliers on each individual miner. Owning one Quartz
 -- doesn't mean the other five miners have Quartz! Evaluate the biggest
 -- *actual team-power gain* from every shop pickaxe/miner combination.
+-- Smart pickaxe purchases for equipped miners, not unrelated shop trophies.
+-- Normal buys respect mandatory research and zone saving; power rescues may
+-- spend a carefully bounded part of cash when mining / research is stuck.
 local function pickaxeTick(data, mg)
     local rescue = config.PowerGateRescue and config.PowerRescuePickaxes and state.rescueActive
-    if not (config.AutoPickaxes or rescue) then return nil end
-    if os.clock() - state.lastPickaxe < (rescue and 2.6 or 18) then return nil end
+    if not config.AutoPickaxes and not rescue then
+        state.pickaxeStatus = "Smart pickaxe shopping disabled"
+        return nil
+    end
+    if os.clock() - state.lastPickaxe < (rescue and 2.8 or 7.0) then return nil end
     local cash = moneyAvailable(data)
     local unlocked = mg.UnlockedZones or {}
     local holders = mg.Holders or {}
+    local teamPower = math.max(1, liveTeamPower(mg))
+    local currentDef = MineConfig.Zones and MineConfig.Zones[mg.CurrentZone or "Z1"]
+    local baseHP = tonumber(currentDef and currentDef.NodeBaseHealth) or 0
+    local dps = math.max(1, estimatedRockDPS(mg))
+    local weakMining = config.SmartPickaxeProgression and baseHP > 0
+        and baseHP / dps > 25
+    local urgent = rescue or weakMining
+    local nextKey, zoneCost = nextZoneFromSave(mg)
+    local _, _, _, researchReady = zoneResearchStatus(mg, nextKey)
+    if nextKey and config.AutoCompleteResearch and not researchReady and not urgent then
+        state.pickaxeStatus = "Saving for required research"
+        return nil
+    end
+    if nextKey and researchReady and config.ZoneSaveForNext and zoneCost
+        and cash >= zoneCost * 0.6 and not urgent then
+        state.pickaxeStatus = "Saving for next zone unlock"
+        return nil
+    end
+    local share = math.clamp(tonumber(config.PickaxeMaxCashShare) or 0.72, 0.10, 0.95)
+    local reserve = math.clamp(tonumber(config.PickaxeCashReserve) or 0.12, 0, 0.70)
+    if rescue then
+        share = math.max(share, math.clamp(config.PowerRescueMaxPurchase, 0.05, 0.95))
+        reserve = math.min(reserve, math.clamp(config.PowerRescueKeepCash, 0, 0.70))
+    end
+
     local unused = {}
     for name, count in pairs(mg.Pickaxes or {}) do
-        if tonumber(count) and count > 0 then
+        if (tonumber(count) or 0) > 0 then
             local _, _, spare = MineConfig.GetPickaxeStock(mg, name)
             local definition = MineConfig.GetPickaxeByName(name)
             if (tonumber(spare) or 0) > 0 and definition then
@@ -1673,68 +1743,81 @@ local function pickaxeTick(data, mg)
             end
         end
     end
-    local bestIndex, bestName, bestScore, bestGain, bestCost
+    local bestIndex, bestName, bestScore, bestGain
+    local reason = "No affordable useful stocked pickaxe"
     for index, def in ipairs(MineConfig.Pickaxes or {}) do
         local cost = tonumber(def.Cost)
-        local newMult = tonumber(def.Multiplier) or 0
-        local requiredZone = tostring(def.ZoneReq or "Z1")
-        if not def.RobuxOnly and cost and cost > 0
-            and unlocked[requiredZone] == true
-            and affordable(data, cost, rescue and "TeamPower" or nil) then
-            local remaining = MineStock.GetRemaining(data, def.Name)
-            if remaining == nil or tonumber(remaining) and tonumber(remaining) > 0 then
-                for holderKey, holder in pairs(holders) do
-                    if type(holder) == "table" and type(holder.CharName) == "string" then
-                        local item = Items.GetItemData(holder.CharName)
-                        if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
-                            local current = MineConfig.GetHolderPickaxe(holder)
-                            local oldMult = math.max(1, tonumber(current and current.Multiplier) or 1)
-                            if newMult > oldMult then
-                                -- Before shopping, equip better inventory gear
-                                -- already owned and unassigned; no duplicates.
-                                local spareBetter = false
-                                for _, have in ipairs(unused) do
-                                    if have >= newMult then spareBetter = true; break end
-                                end
-                                if not spareBetter then
-                                    local curDamage = tonumber(MineConfig.GetHolderDamage(holder, item)) or 0
-                                    local enchant = tonumber(MineConfig.GetEnchantPowerMult(mg, holderKey)) or 1
-                                    local gain = math.max(0, curDamage * enchant * (newMult / oldMult - 1))
-                                    -- When wealthy, prioritise big power gains
-                                    -- instead of wasting restock windows buying
-                                    -- weak tools merely because they're cheap.
-                                    -- When cash is tight, penalise expensive buys.
-                                    local budgetScale = math.max(1, cash * 0.02)
-                                    local score = gain / (1 + cost / budgetScale)
-                                    if gain > 0 and (not bestScore or score > bestScore) then
-                                        bestScore, bestGain, bestIndex, bestName, bestCost = score, gain, index, def.Name, cost
+        local mult = tonumber(def.Multiplier) or 0
+        local zone = tostring(def.ZoneReq or "Z1")
+        if not def.RobuxOnly and cost and cost > 0 and cost < math.huge
+            and unlocked[zone] == true and cash >= cost
+            and cost <= cash * share and cash - cost >= cash * reserve then
+            local available = MineStock.GetRemaining(data, def.Name)
+            if available == nil or (tonumber(available) or 0) > 0 then
+                local alreadySpareBetter = false
+                for _, ownedMult in ipairs(unused) do
+                    if ownedMult >= mult then
+                        alreadySpareBetter = true
+                        break
+                    end
+                end
+                if not alreadySpareBetter then
+                    for key, holder in pairs(holders) do
+                        if type(holder) == "table" and type(holder.CharName) == "string" then
+                            local item = Items.GetItemData(holder.CharName)
+                            if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
+                                local current = MineConfig.GetHolderPickaxe(holder)
+                                local oldMult = math.max(1, tonumber(current and current.Multiplier) or 1)
+                                if mult > oldMult then
+                                    local damage = tonumber(MineConfig.GetHolderDamage(holder, item)) or 0
+                                    local enchant = tonumber(MineConfig.GetEnchantPowerMult(mg, key)) or 1
+                                    local gain = math.max(0, damage * enchant * (mult / oldMult - 1))
+                                    local relativeGain = gain / teamPower
+                                    -- Do not spend on marginal / sideways upgrades.
+                                    if gain > 0 and relativeGain >= (urgent and 0.035 or 0.09) then
+                                        local costFraction = cost / math.max(cash, 1)
+                                        local score = relativeGain * (urgent and 1.8 or 1)
+                                            / (0.15 + math.sqrt(costFraction))
+                                        if not bestScore or score > bestScore then
+                                            bestScore, bestGain = score, gain
+                                            bestIndex, bestName = index, def.Name
+                                        end
+                                    else
+                                        reason = "Available pickaxes give too little team-power improvement"
                                     end
                                 end
                             end
                         end
                     end
+                else
+                    reason = "Equipping better owned pickaxes before buying another"
                 end
+            else
+                reason = "Waiting for pickaxe shop restock"
             end
         end
     end
     if not bestIndex then
-        if rescue then state.rescueState = "Waiting for affordable available team-power upgrades / shop restock" end
+        state.pickaxeStatus = reason
+        if rescue then state.rescueState = reason end
         return nil
     end
     state.lastPickaxe = os.clock()
-    local previous = tonumber(MineConfig.GetPickaxeStock(mg, bestName)) or 0
-    if sendConfirmed("MineBuyPickaxe", function(_, fresh)
-        return fresh and (tonumber(MineConfig.GetPickaxeStock(fresh, bestName)) or 0) > previous
-    end, 2.0, bestIndex) then
-        if rescue then
-
-            state.rescueState = string.format("Purchased %s; estimated +%.3g power when equipped", bestName, bestGain)
-        end
+    state.pickaxeStatus = "Trying " .. bestName
+    local oldOwned = tonumber(MineConfig.GetPickaxeStock(mg, bestName)) or 0
+    local success = sendConfirmed("MineBuyPickaxe", function(_, fresh)
+        return fresh and (tonumber(MineConfig.GetPickaxeStock(fresh, bestName)) or 0) > oldOwned
+    end, 3.3, bestIndex)
+    if success then
+        state.pickaxeBuys += 1
+        state.pickaxeStatus = string.format("Purchased %s (+%.3g potential team power)", bestName, bestGain)
         state.lastPickaxeEquip = -100
-        return "Purchased " .. bestName .. " (next: equip on strongest miner)"
+        if rescue then state.rescueState = state.pickaxeStatus end
+        return state.pickaxeStatus
     end
+    state.pickaxeStatus = "Purchase unconfirmed: " .. bestName
+    return nil
 end
-
 local function characterLevelsTick(data, mg)
     if not config.AutoCharacterLevels then return nil end
     local bestKey, bestScore
@@ -2675,6 +2758,8 @@ toggle(progressTab, "Save Cash for Zone Unlocks", "ZoneSaveForNext")
 toggle(progressTab, "Upgrade Equipped Characters", "AutoCharacterLevels")
 toggle(progressTab, "Upgrade Crew Speed", "AutoCrewSpeed")
 toggle(progressTab, "Equip Owned Pickaxes", "AutoEquipOwnedPickaxes")
+toggle(progressTab, "Automatically Buy Useful Pickaxes", "AutoPickaxes")
+toggle(progressTab, "Buy Pickaxes When Mining Is Too Slow", "SmartPickaxeProgression")
 progressTab:CreateSection("Blocked by team power?")
 toggle(progressTab, "Respect Research Power Requirements", "PowerAwareResearch")
 toggle(progressTab, "Improve Power to Unlock Research", "PowerGateRescue")
@@ -2706,7 +2791,6 @@ toggle(extrasTab, "Run Eligible Trials", "AutoTrialRuns")
 toggle(extrasTab, "Send Crew to Special Rocks (experimental)", "AutoFocusSpecial")
 extrasTab:CreateLabel("Trials and crew-focus are optional. No Robux spending.")
 extrasTab:CreateSection("Expert controls")
-toggle(extrasTab, "Optional Cash Pickaxe Purchases", "AutoPickaxes")
 toggle(extrasTab, "Auto Expand Crew Slots", "AutoSlots")
 toggle(extrasTab, "Upgrade Tap Damage", "AutoTapUpgrades")
 toggle(extrasTab, "Crafting When Enabled", "AutoCrafting")
@@ -2716,8 +2800,10 @@ toggle(extrasTab, "Mine Cash During Research Wait", "ResearchCashBoost")
 toggle(extrasTab, "Fast Responsive Scheduling", "FasterScheduling")
 slider(extrasTab, "Save For Zone At (%)", "ZoneSaveAt", 10, 95, 5, percent)
 slider(extrasTab, "Max Zone Rock Time (seconds)", "ZoneMaxRockSeconds", 15, 180, 5)
-slider(extrasTab, "Power: Max Purchase (%)", "PowerRescueMaxPurchase", 5, 45, 5, percent)
-slider(extrasTab, "Power: Keep Money (%)", "PowerRescueKeepCash", 15, 80, 5, percent)
+slider(extrasTab, "Pickaxe: Max Cash Spend (%)", "PickaxeMaxCashShare", 10, 90, 5, percent)
+slider(extrasTab, "Pickaxe: Keep Cash (%)", "PickaxeCashReserve", 0, 70, 5, percent)
+slider(extrasTab, "Power: Max Purchase (%)", "PowerRescueMaxPurchase", 5, 90, 5, percent)
+slider(extrasTab, "Power: Keep Money (%)", "PowerRescueKeepCash", 0, 80, 5, percent)
 slider(extrasTab, "Colossus Time Limit (seconds)", "ColossusMaxSeconds", 15, 180, 5)
 slider(extrasTab, "Keep Summon Scrolls", "KeepSummonScrolls", 0, 30, 1)
 dropdown(extrasTab, "Potion Strategy", "PotionMode", {"Balanced", "Cash", "Rare finds", "Power"})

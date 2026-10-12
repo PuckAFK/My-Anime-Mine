@@ -1,3 +1,10 @@
+-- PuckAFK My Anime Mine - COMPLETE SMART AUTOFARM - 2026-10-12
+-- Standalone main script based on the supplied original source and game dump.
+-- Integrated stock-aware smart pickaxe buying and equipped-miner optimization.
+-- v2.1: immediate chest-to-seller cash-out when ore funds required research or a zone unlock.
+-- v2.3: simple first-run PuckUI, default-on safe progression, quick presets, live status; advanced controls separated.
+-- Uses PuckUI via its canonical URL; never initiates Robux purchases.
+-- Game-server interactions are subject to live-game availability and verification.
 
 local SERVICE = function(name) return game:GetService(name) end
 local Players = SERVICE("Players")
@@ -38,16 +45,23 @@ local defaults = {
     Mine = true,
     AutoChest = true,
     AutoSellOre = true,
+    AutoCashoutProgression = true, -- auto collect chest ore and sell once it can fund next research/zone
     EquipBest = true,
     AutoSkills = true,
     AutoCompleteResearch = true,
     AutoTapUpgrades = true,
     AutoSlots = true,
     AutoCharacterLevels = true,
+    AutoMinerMineSpeed = true, -- upgrade each selected miner's mining hit interval
+    AntiAFK = true, -- passive idle prevention; independent of the farm switch
     AutoCrafting = false,
-    AutoPickaxes = false,
+    AutoPickaxes = true,
+    PickaxeMode = "Smart",
+    PickaxeSpendPercent = 0.50,
+    PickaxeReservePercent = 0.15,
+    PickaxeMinTeamGain = 0.015,
     AutoEquipOwnedPickaxes = true,
-    EnableOwnedAutoSell = false,
+    EnableOwnedAutoSell = true, -- only uses an already owned gamepass; never purchases one
     AutoFocusSpecial = false,
     AutoZone = true,
     AutoBuyZones = true,
@@ -61,13 +75,13 @@ local defaults = {
     AutoEventClaims = true, AutoTrialClaims = true,
     AutoTrialRuns = false, TrialMinPowerRatio = 1.5,
     AutoGear = true, AutoCrewSpeed = true,
-    AutoPotions = false, PotionMode = "Balanced", PotionReserve = 2,
+    AutoPotions = true, PotionMode = "Balanced", PotionReserve = 2, -- uses only spare owned potions
     AutoEnchants = true,
     AutoPerformance = false,
     FocusSpecialRocks = true, WeatherAware = true,
     KeepSummonScrolls = 2,
     ColossusMaxSeconds = 45, UpgradeReserve = 0.18,
-    AutoSummon = false,
+    AutoSummon = true, -- uses only spare scrolls after KeepSummonScrolls reserve
     NativeTravel = true,
     MineMode = "Balanced",
     BudgetPercent = 0.22,
@@ -127,6 +141,9 @@ local state = {
     target = "None", plot = nil,
     oreSales = 0, rocksMined = 0, chests = 0, steps = 0,
     lastChest = -100, lastSell = -100, lastEquip = -100,
+    cashoutStatus = "Waiting for sellable chest ore", cashoutGoal = "None",
+    cashoutChestWorth = 0, cashoutInventoryWorth = 0,
+    cashoutChestCollections = 0, cashoutSells = 0, lastCashoutAt = -100,
     lastSpend = -100, lastSpin = -100, lastSummon = -100,
     lastQuest = -100, lastZone = -100, lastPickaxe = -100,
     lastHome = -100, lastTravel = -100, lastScan = 0,
@@ -138,6 +155,8 @@ local state = {
     ownedPickaxeEquips = 0, powerCache = nil, powerCacheAt = 0,
     recentRock = nil, recentRockAt = 0, lastOwnAutoSell = -100,
     lastPickaxeEquip = -100, lastActualSell = -100,
+    pickaxeStatus = "Waiting for shop data", pickaxeBuys = 0,
+    pickaxePending = {},
     lastFastClaim = -100, nativeAutoSellState = "Not enabled",
     jumpCount = 0, wallAvoids = 0, flankCount = 0,
     zoneBuys = 0, zoneGoal = "Scanning zones", zoneWait = "",
@@ -153,6 +172,10 @@ local state = {
     currentRockScore = 0, observedDPS = 0, mineSample = nil,
     activeTrial = false, trialNext = 0, lastAdvanced = -100,
     lastSpeedUpgrade = -100, enchantEquips = 0, upgradeCursor = 0,
+    minerStatUpgrades = {Damage = 0, Speed = 0, MineSpeed = 0},
+    minerStatsLastToken = "", lastMinerStatCheck = -100,
+    minerStatsStatus = "Checking assigned miners",
+    antiAfkTriggers = 0, lastAntiAfk = -100, antiAfkStatus = "Disabled",
     cancelledDeadWalks = 0, cancelledMoveTo = 0,
     directStops = 0, timeMining = 0, timeWalking = 0,
     timeSelling = 0, startedAt = os.clock(), rocksAt = {},
@@ -188,6 +211,8 @@ local function sendConfirmed(action, check, waitSec, ...)
     local scope = action
     if action == "MineBuySkill" then
         scope = action .. ":" .. tostring(args[1]) .. ":" .. tostring(args[2]) .. ":" .. tostring(args[3])
+    elseif action == "MineBuyPickaxe" then
+        scope = action .. ":" .. tostring(args[1])
     elseif action == "MineSelectZone" or action == "MineEquipPickaxe"
         or action == "MineUpgradeCharacter" or action == "MineAutoSellSet"
         or action == "MineEquipEnchant" then
@@ -1127,12 +1152,12 @@ local function totalChestCount(entries)
     for _, e in ipairs(entries) do count += tonumber(e.Count) or 0 end
     return count
 end
-local function collectChest(plot, mg, epoch, force)
+local function collectChest(plot, mg, epoch, force, progressionUrgent)
     if not config.AutoChest then return false end
     local full = config.UrgentFullChest and plot and plot:GetAttribute("MineChestFull") == true
     -- A full chest can stall the crew; prefer a prompt retry, but never
     -- hammer a failing collection action every scheduler tick.
-    local minimumInterval = full and 5 or 16
+    local minimumInterval = progressionUrgent and 2.5 or (full and 5 or 16)
     if os.clock()-state.lastChestAttempt < minimumInterval then return false end
     local entries = getChestEntries(mg)
     local amount = totalChestCount(entries)
@@ -1147,8 +1172,21 @@ local function collectChest(plot, mg, epoch, force)
     local cp = chestBase:FindFirstChild("ChestPrompt")
     local reach = cp and math.min(8.0, math.max(5, cp.MaxActivationDistance)) or 8
     if not standAround(chestBase.Position, reach, epoch, "Chest", chestBase.Parent) then return false end
+    local beforeChest = table.clone(mg.Chest or {})
+    local beforeBagOres = table.clone(mg.Ores or {})
     local ok = sendConfirmed("MineTakeChest", function(_, fresh)
-        return fresh and totalChestCount(getChestEntries(fresh)) < amount
+        if not fresh then return false end
+        if totalChestCount(getChestEntries(fresh)) < amount then return true end
+        -- New ore can enter the chest WHILE it is being collected. Confirm a
+        -- reduction in any existing stack, or an increased carried-ore stack,
+        -- even if the total chest count rose during the transfer.
+        for key, initial in pairs(beforeChest) do
+            if (tonumber((fresh.Chest or {})[key]) or 0) < (tonumber(initial) or 0)
+                or (tonumber((fresh.Ores or {})[key]) or 0) > (tonumber(beforeBagOres[key]) or 0) then
+                return true
+            end
+        end
+        return false
     end, 3.2)
     if ok then
 
@@ -1171,7 +1209,9 @@ local function sellableOre(mg)
     return keys, worth
 end
 local function sellOre(mg, epoch, force)
-    if not config.AutoSellOre or os.clock() - state.lastSellAttempt < 30 then return false end
+    -- Required-progression funding ignores the ordinary seller-trip cooldown,
+    -- but retains a short anti-spam guard if navigation or the server fails.
+    if not config.AutoSellOre or os.clock() - state.lastSellAttempt < (force and 5 or 30) then return false end
     local keys, worth = sellableOre(mg)
     if #keys == 0 then return false end
     local cash = moneyAvailable(select(1, getMine()))
@@ -1217,10 +1257,12 @@ local function sellOre(mg, epoch, force)
         state.lastFailure = "Seller navigation blocked"
         return false
     end
-    local sold = sendConfirmed("MineSellItems", function(_, fresh)
+    local sold = sendConfirmed("MineSellItems", function(freshData, fresh)
         if not fresh then return false end
         local _, newWorth = sellableOre(fresh)
-        return newWorth < worth
+        -- New ore can be mined during the trip. Increasing money still confirms
+        -- a sale if new ore hid the inventory decrease.
+        return newWorth < worth or moneyAvailable(freshData) > cash
     end, 3.2, keys)
     if sold then
 
@@ -1369,6 +1411,93 @@ local function researchPlan(mg, zone)
         return tostring(a.Node.Id) < tostring(b.Node.Id)
     end)
     return ordered, unresolved
+end
+
+-- IMPORTANT: sale value is item.Worth for the entire stack (not price per unit).
+-- Only ore is counted/sold; collecting "Take All" still preserves miners and
+-- other loot in inventory. MineInventory.ChestEntries applies current research
+-- sell multipliers, matching the game's chest and inventory UI.
+local function chestOreWorth(entries)
+    local worth = 0
+    for _, entry in ipairs(entries or {}) do
+        if entry.Kind == "Ore" and (tonumber(entry.Count) or 0) > 0 then
+            local value = tonumber(entry.Worth) or 0
+            if value > 0 and value < math.huge and value == value then
+                worth += value
+            end
+        end
+    end
+    return worth
+end
+
+-- Evaluate CURRENT required research/next consecutive zone, never an unrelated
+-- optional node or an unreleased zone. This runs at the movement scheduler,
+-- which can act without waiting for the usual chest-fill / sale thresholds.
+local function progressionCashoutPlan(data, mg, chestEntries)
+    if not config.AutoCashoutProgression or not config.AutoChest or not config.AutoSellOre
+        or not config.AutoBuyZones or type(mg) ~= "table" then return nil end
+    local nextKey, zoneCost, zone = nextZoneFromSave(mg)
+    if not nextKey then return nil end
+    local cash = moneyAvailable(data)
+    local _, bagWorth = sellableOre(mg)
+    local chestWorth = chestOreWorth(chestEntries)
+    state.cashoutInventoryWorth, state.cashoutChestWorth = bagWorth, chestWorth
+    local available = cash + bagWorth + chestWorth
+    if bagWorth <= 0 and chestWorth <= 0 then return nil end
+
+    local _, _, _, gateComplete = zoneResearchStatus(mg, nextKey)
+    local goalCost, goalName
+    if gateComplete then
+        if config.ZoneBuyMode == "Power ready" then
+            local hp = tonumber(zone and zone.NodeBaseHealth) or 0
+            if hp > 0 and hp / math.max(1, estimatedRockDPS(mg)) > config.ZoneMaxRockSeconds then
+                return nil
+            end
+        end
+        if zoneCost and zoneCost > cash and zoneCost <= available then
+            goalCost, goalName = zoneCost, "Unlock " .. tostring(nextKey)
+        end
+    elseif config.AutoCompleteResearch then
+        local gate = MineConfig.ZoneResearchGateFor(nextKey)
+        if gate then
+            local candidates = researchPlan(mg, gate)
+            local currentPower = liveTeamPower(mg)
+            -- Don't leave a currently affordable required pip waiting while
+            -- liquidating for a more expensive one; normal researchTick buys it.
+            local immediatelyBuyable = false
+            for _, option in ipairs(candidates) do
+                local requiredPower
+                if config.PowerAwareResearch and type(MineConfig.GetSkillPowerReq) == "function" then
+                    local ok, power = pcall(MineConfig.GetSkillPowerReq,
+                        gate, option.Node.Family, option.Level + 1)
+                    if ok then requiredPower = tonumber(power) end
+                end
+                if not requiredPower or requiredPower <= currentPower then
+                    local scope = "MineBuySkill:" .. tostring(gate) .. ":" .. tostring(option.Node.Family)
+                        .. ":" .. tostring(option.Node.Id)
+                    if (state.actionBlocks[scope] or 0) <= os.clock() then
+                        if option.Cost <= cash then
+                            immediatelyBuyable = true
+                            break
+                        end
+                        if option.Cost > cash and option.Cost <= available
+                            and (not goalCost or option.Cost < goalCost) then
+                            goalCost = option.Cost
+                            goalName = "Research " .. tostring(option.Node.Name or option.Node.Id)
+                        end
+                    end
+                end
+            end
+            if immediatelyBuyable then return nil end
+        end
+    end
+    if not goalCost then return nil end
+    return {
+        Name = goalName, Cost = goalCost, Cash = cash,
+        BagWorth = bagWorth, ChestWorth = chestWorth,
+        -- Don't collect the chest unless inventory ore is insufficient.
+        NeedChest = cash + bagWorth < goalCost,
+    }
 end
 
 local function researchTick(data, mg)
@@ -1656,60 +1785,147 @@ end
 -- Pickaxes are multipliers on each individual miner. Owning one Quartz
 -- doesn't mean the other five miners have Quartz! Evaluate the biggest
 -- *actual team-power gain* from every shop pickaxe/miner combination.
+-- Smart pickaxe planner: live stock, real unlocks, earned team power, one purchase at a time.
 local function pickaxeTick(data, mg)
     local rescue = config.PowerGateRescue and config.PowerRescuePickaxes and state.rescueActive
-    if not (config.AutoPickaxes or rescue) then return nil end
-    if os.clock() - state.lastPickaxe < (rescue and 2.6 or 18) then return nil end
+    if not (config.AutoPickaxes or rescue) then
+        state.pickaxeStatus = "Optional automatic purchases disabled"
+        return nil
+    end
+    local now = os.clock()
+    if now - state.lastPickaxe < (rescue and 2.8 or 5.5) then return nil end
+    state.lastPickaxe = now
+
     local cash = moneyAvailable(data)
-    local unlocked = mg.UnlockedZones or {}
+    local stockGlobal = MineStock.GetGlobal()
+    if not stockGlobal or type(stockGlobal.CurrentStock) ~= "table" then
+        state.pickaxeStatus = "Waiting for live server shop stock"
+        return nil
+    end
     local holders = mg.Holders or {}
-    local unused = {}
+    local miners = {}
+    local teamPower = math.max(1, liveTeamPower(mg))
+    local spares = {}
     for name, count in pairs(mg.Pickaxes or {}) do
-        if tonumber(count) and count > 0 then
+        if (tonumber(count) or 0) > 0 then
             local _, _, spare = MineConfig.GetPickaxeStock(mg, name)
-            local definition = MineConfig.GetPickaxeByName(name)
-            if (tonumber(spare) or 0) > 0 and definition then
-                unused[#unused+1] = tonumber(definition.Multiplier) or 1
+            local def = MineConfig.GetPickaxeByName(name)
+            if def and (tonumber(spare) or 0) > 0 then
+                spares[#spares + 1] = {mult = tonumber(def.Multiplier) or 1, name = name}
             end
         end
     end
-    local bestIndex, bestName, bestScore, bestGain, bestCost
+    for holderKey, holder in pairs(holders) do
+        if type(holder) == "table" and type(holder.CharName) == "string" then
+            local item = Items.GetItemData(holder.CharName)
+            if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
+                local oldDef = MineConfig.GetHolderPickaxe(holder)
+                local oldMult = math.max(1, tonumber(oldDef and oldDef.Multiplier) or 1)
+                local fullDamage = (tonumber(MineConfig.GetHolderDamage(holder, item)) or 0)
+                    * (tonumber(MineConfig.GetEnchantPowerMult(mg, holderKey)) or 1)
+                if fullDamage > 0 then
+                    miners[#miners + 1] = {key = holderKey, current = oldMult, power = fullDamage}
+                end
+            end
+        end
+    end
+    if #miners == 0 then
+        state.pickaxeStatus = "Waiting for equipped mining characters"
+        return nil
+    end
+    -- The owned-equipment loop has priority. A duplicate purchase here would waste coins.
+    if config.AutoEquipOwnedPickaxes then
+        for _, miner in ipairs(miners) do
+            for _, spare in ipairs(spares) do
+                if spare.mult > miner.current * 1.001 then
+                    state.lastPickaxeEquip = -100
+                    state.pickaxeStatus = "Equipping an already-owned better pickaxe first"
+                    return nil
+                end
+            end
+        end
+    end
+
+    local nextKey, zoneCost = nextZoneFromSave(mg)
+    local _, _, _, researchReady = zoneResearchStatus(mg, nextKey)
+    if nextKey and config.AutoBuyZones and config.AutoCompleteResearch
+        and not researchReady and not rescue then
+        state.pickaxeStatus = "Saving for required zone research"
+        return nil
+    end
+    -- Prefer the zone unlock once savings are substantial, except for a small,
+    -- unusually high-value upgrade when the current rocks are already slow.
+    local preservingZone = nextKey and researchReady and config.AutoBuyZones
+        and config.ZoneSaveForNext and zoneCost and cash >= zoneCost * 0.25 and not rescue
+    local currentZone = MineConfig.Zones and MineConfig.Zones[mg.CurrentZone or "Z1"]
+    local currentRockHealth = tonumber(currentZone and currentZone.NodeBaseHealth) or 0
+    local slowMiners = currentRockHealth > teamPower * 14
+
+    local unlocked = mg.UnlockedZones or {}
+    local minTeamGain = math.clamp(tonumber(config.PickaxeMinTeamGain) or 0.015, 0, 1)
+    local cap = math.clamp(tonumber(config.PickaxeSpendPercent) or 0.50, 0.05, 0.95)
+    local reserve = math.clamp(tonumber(config.PickaxeReservePercent) or 0.15, 0, 0.90)
+    if config.PickaxeMode == "Conservative" then
+        cap = math.min(cap, 0.30)
+        reserve = math.max(reserve, 0.35)
+    elseif config.PickaxeMode == "Aggressive" then
+        cap = math.max(cap, 0.78)
+        reserve = math.min(reserve, 0.07)
+    end
+    local deficit = rescue and math.max(0, (tonumber(state.rescueRequired) or 0) - teamPower) or 0
+    local best, bestScore, bestGain, bestCloses = nil, nil, nil, nil
+    local stocked, affordableStock, locked = 0, 0, 0
+    local secsLeft = math.max(0, tonumber(MineStock.SecondsLeft()) or 0)
+
     for index, def in ipairs(MineConfig.Pickaxes or {}) do
+        local name = def.Name
         local cost = tonumber(def.Cost)
         local newMult = tonumber(def.Multiplier) or 0
-        local requiredZone = tostring(def.ZoneReq or "Z1")
-        if not def.RobuxOnly and cost and cost > 0
-            and unlocked[requiredZone] == true
-            and affordable(data, cost, rescue and "TeamPower" or nil) then
-            local remaining = MineStock.GetRemaining(data, def.Name)
-            if remaining == nil or tonumber(remaining) and tonumber(remaining) > 0 then
-                for holderKey, holder in pairs(holders) do
-                    if type(holder) == "table" and type(holder.CharName) == "string" then
-                        local item = Items.GetItemData(holder.CharName)
-                        if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
-                            local current = MineConfig.GetHolderPickaxe(holder)
-                            local oldMult = math.max(1, tonumber(current and current.Multiplier) or 1)
-                            if newMult > oldMult then
-                                -- Before shopping, equip better inventory gear
-                                -- already owned and unassigned; no duplicates.
-                                local spareBetter = false
-                                for _, have in ipairs(unused) do
-                                    if have >= newMult then spareBetter = true; break end
-                                end
-                                if not spareBetter then
-                                    local curDamage = tonumber(MineConfig.GetHolderDamage(holder, item)) or 0
-                                    local enchant = tonumber(MineConfig.GetEnchantPowerMult(mg, holderKey)) or 1
-                                    local gain = math.max(0, curDamage * enchant * (newMult / oldMult - 1))
-                                    -- When wealthy, prioritise big power gains
-                                    -- instead of wasting restock windows buying
-                                    -- weak tools merely because they're cheap.
-                                    -- When cash is tight, penalise expensive buys.
-                                    local budgetScale = math.max(1, cash * 0.02)
-                                    local score = gain / (1 + cost / budgetScale)
-                                    if gain > 0 and (not bestScore or score > bestScore) then
-                                        bestScore, bestGain, bestIndex, bestName, bestCost = score, gain, index, def.Name, cost
-                                    end
-                                end
+        if type(name) == "string" and not def.RobuxOnly and type(def.Stock) == "table"
+            and cost and cost > 0 and cost < math.huge and cost == cost and newMult > 1 then
+            if not unlocked[tostring(def.ZoneReq or "Z1")] then
+                locked += 1
+            else
+                local remaining = MineStock.GetRemaining(data, name)
+                if remaining and remaining > 0 then
+                    stocked += 1
+                    local bestLocalGain = 0
+                    for _, miner in ipairs(miners) do
+                        if newMult > miner.current * 1.001 then
+                            local gain = miner.power * (newMult / miner.current - 1)
+                            if gain > bestLocalGain then bestLocalGain = gain end
+                        end
+                    end
+                    local relative = bestLocalGain / teamPower
+                    local closesGate = deficit > 0 and bestLocalGain >= deficit
+                    local enoughImpact = bestLocalGain > 0 and (relative >= minTeamGain or rescue)
+                    if enoughImpact and cash >= cost then
+                        local share = cost / math.max(1, cash)
+                        local buyCap, keepPercent = cap, reserve
+                        if rescue then
+                            buyCap = math.max(cap, math.clamp(config.PowerRescueMaxPurchase, 0.05, 0.85))
+                            keepPercent = math.min(reserve, math.clamp(config.PowerRescueKeepCash, 0, 0.90))
+                            if closesGate then
+                                buyCap = math.max(buyCap, 0.92)
+                                keepPercent = math.min(keepPercent, 0.08)
+                            end
+                        end
+                        local strongException = slowMiners and relative >= 0.40
+                            and share <= 0.08
+                        if share <= buyCap and share <= 1 - keepPercent
+                            and (not preservingZone or strongException) then
+                            affordableStock += 1
+                            local score = (relative / (0.12 + share))
+                                * (1 + math.min(1.5, math.log10(math.max(1, newMult))))
+                            if rescue then
+                                score *= closesGate and 20 or (1 + math.min(5, bestLocalGain / math.max(1, deficit) * 6))
+                            end
+                            -- A temporary failed target should not lock all shop purchases.
+                            local blocked = (state.actionBlocks["MineBuyPickaxe:" .. tostring(index)] or 0) > now
+                            local pending = state.pickaxePending and (state.pickaxePending[name] or 0) > now
+                            if not blocked and not pending and (not bestScore or score > bestScore) then
+                                best = {index = index, name = name, cost = cost}
+                                bestScore, bestGain, bestCloses = score, bestLocalGain, closesGate
                             end
                         end
                     end
@@ -1717,59 +1933,181 @@ local function pickaxeTick(data, mg)
             end
         end
     end
-    if not bestIndex then
-        if rescue then state.rescueState = "Waiting for affordable available team-power upgrades / shop restock" end
+
+    if not best then
+        if stocked == 0 then
+            state.pickaxeStatus = string.format("No unlocked pickaxes in stock; restock in %d:%02d", secsLeft // 60, secsLeft % 60)
+        elseif affordableStock == 0 then
+            state.pickaxeStatus = preservingZone and ("Saving for " .. nextKey .. " zone purchase")
+                or (rescue and "Saving for pickaxe power-upgrade; research requires more team power"
+                or "Waiting for an affordable, worthwhile pickaxe")
+        else
+            state.pickaxeStatus = "Waiting for shop verification cooldown"
+        end
         return nil
     end
-    state.lastPickaxe = os.clock()
-    local previous = tonumber(MineConfig.GetPickaxeStock(mg, bestName)) or 0
-    if sendConfirmed("MineBuyPickaxe", function(_, fresh)
-        return fresh and (tonumber(MineConfig.GetPickaxeStock(fresh, bestName)) or 0) > previous
-    end, 2.0, bestIndex) then
-        if rescue then
 
-            state.rescueState = string.format("Purchased %s; estimated +%.3g power when equipped", bestName, bestGain)
-        end
+    local ownedBefore = tonumber((mg.Pickaxes or {})[best.name]) or 0
+    state.pickaxePending = state.pickaxePending or {}
+    state.pickaxePending[best.name] = now + 7
+    state.pickaxeStatus = "Buying " .. best.name .. " (server verification)"
+    local purchased = sendConfirmed("MineBuyPickaxe", function(_, fresh)
+        return fresh and (tonumber((fresh.Pickaxes or {})[best.name]) or 0) > ownedBefore
+    end, 2.8, best.index)
+    if purchased then
+        state.pickaxeBuys = (state.pickaxeBuys or 0) + 1
+        state.pickaxePending[best.name] = nil
         state.lastPickaxeEquip = -100
-        return "Purchased " .. bestName .. " (next: equip on strongest miner)"
+        if rescue then
+            state.rescuePickaxeBuys = (state.rescuePickaxeBuys or 0) + 1
+            state.rescueState = string.format("Upgraded %s (+%.3g power); equipping", best.name, bestGain)
+        end
+        state.pickaxeStatus = string.format("Bought %s; estimated +%.3g team power%s", best.name, bestGain,
+            bestCloses and " (research gate met when equipped)" or "")
+        return "Smart pickaxe: " .. best.name
     end
+    state.pickaxeStatus = "Purchase not confirmed; retrying safely after cooldown"
+    return nil
 end
 
+-- All three buttons shown on the game's miner detail screen send the same
+-- MineUpgradeCharacter event with an explicit stat kind: Damage / Speed / MineSpeed.
+-- Upgrade ACTUALLY assigned miners, not unequipped inventory characters. Rotate
+-- fairly across both holders and stat types to avoid upgrading only one strong
+-- miner forever. No paid purchases, capped levels, or unverified repeated sends.
 local function characterLevelsTick(data, mg)
-    if not config.AutoCharacterLevels then return nil end
-    local bestKey, bestScore
-    for key, holder in pairs(mg.Holders or {}) do
-        if type(holder) == "table" and type(holder.CharName) == "string" then
-            local item = Items.GetItemData(holder.CharName)
-            if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
-                local current = MineConfig.GetHolderLevel(holder)
-                local cap = MineConfig.GetCharLevelCap(mg, key, holder, item, Items.GetItemData)
-                if current < cap then
-                    local cost = MineConfig.GetCharacterUpgradeCost(current, item)
-                    if affordable(data, cost, config.PowerRescueLevels and "TeamPower" or nil) then
-                        local base = MineConfig.GetHolderBaseDamage(holder, item)
-                        local pick = MineConfig.GetHolderPickaxe(holder)
-                        local mult = (pick and pick.Multiplier) or 1
-                        local before = MineConfig.GetCharacterLevelMultiplier(current)
-                        local after = MineConfig.GetCharacterLevelMultiplier(current + 1)
-                        local gain = math.max(0, base * mult * (after - before))
-                        local score = math.log10(1 + gain) / (2 + math.log10(math.max(1, cost)))
-                        if not bestScore or score > bestScore then bestScore, bestKey = score, key end
+    if not (config.AutoCharacterLevels or config.AutoCrewSpeed or config.AutoMinerMineSpeed) then
+        state.minerStatsStatus = "Automatic miner stats disabled"
+        return nil
+    end
+    if os.clock() - state.lastMinerStatCheck < 0.75 then return nil end
+    state.lastMinerStatCheck = os.clock()
+    if type(mg) ~= "table" or type(mg.Holders) ~= "table" then return nil end
+
+    local options, assigned, copied, capped, cashBlocked = {}, 0, 0, 0, 0
+    local rescue = config.PowerGateRescue and state.rescueActive
+    local stats = {
+        {Name = "Damage", On = config.AutoCharacterLevels,
+            Level = MineConfig.GetHolderLevel, Max = nil,
+            Cost = MineConfig.GetCharacterUpgradeCost, Order = 1},
+        {Name = "MineSpeed", On = config.AutoMinerMineSpeed,
+            Level = MineConfig.GetHolderMineSpeedLevel, Max = MineConfig.CharMineSpeedMaxLevel,
+            Cost = MineConfig.GetCharacterMineSpeedUpgradeCost, Order = 2},
+        {Name = "Speed", On = config.AutoCrewSpeed,
+            Level = MineConfig.GetHolderSpeedLevel, Max = MineConfig.CharSpeedMaxLevel,
+            Cost = MineConfig.GetCharacterSpeedUpgradeCost, Order = 3},
+    }
+    for holderKey, holder in pairs(mg.Holders) do
+        if type(holder) == "table" and type(holder.CharName) == "string" and holder.CharName ~= "" then
+            local success, item = pcall(Items.GetItemData, holder.CharName)
+            if success and type(item) == "table" and item.Type == "Character"
+                and item.MineRole ~= "Hauler" then
+                assigned += 1
+                -- Copied/scaled miners display disabled 'Copied' stat buttons.
+                local copyOK, copyText = pcall(MineConfig.ScaledCopyText, holder, item)
+                if copyOK and copyText then
+                    copied += 1
+                else
+                    for _, stat in ipairs(stats) do
+                        if stat.On and (not rescue or stat.Name == "Damage") then
+                            local ok, level = pcall(stat.Level, holder)
+                            level = ok and tonumber(level) or nil
+                            local limit = tonumber(stat.Max)
+                            if stat.Name == "Damage" then
+                                local capOK, cap = pcall(MineConfig.GetCharLevelCap,
+                                    mg, holderKey, holder, item, Items.GetItemData)
+                                limit = capOK and tonumber(cap) or tonumber(MineConfig.CharMaxLevel)
+                            end
+                            if level and limit and level >= 1 and level < limit then
+                                local costOK, cost = pcall(stat.Cost, level, item)
+                                cost = costOK and tonumber(cost) or nil
+                                if cost and cost > 0 and cost < math.huge and cost == cost then
+                                    local kind = stat.Name == "Damage" and "TeamPower" or nil
+                                    if affordable(data, cost, kind) then
+                                        local token = tostring(holderKey) .. "|" .. tostring(stat.Order)
+                                        local score = 0
+                                        if rescue and stat.Name == "Damage" then
+                                            local baseOK, base = pcall(MineConfig.GetHolderBaseDamage, holder, item)
+                                            local pickOK, pick = pcall(MineConfig.GetHolderPickaxe, holder)
+                                            local oldOK, oldLevelMult = pcall(MineConfig.GetCharacterLevelMultiplier, level)
+                                            local newOK, newLevelMult = pcall(MineConfig.GetCharacterLevelMultiplier, level + 1)
+                                            if baseOK and oldOK and newOK then
+                                                score = math.max(0, (tonumber(base) or 0)
+                                                    * (pickOK and tonumber(pick and pick.Multiplier) or 1)
+                                                    * ((tonumber(newLevelMult) or 1) - (tonumber(oldLevelMult) or 1)))
+                                                    / math.max(1, cost)^0.10
+                                            end
+                                        end
+                                        options[#options + 1] = {
+                                            Key = holderKey, CharName = holder.CharName,
+                                            Name = stat.Name, Level = level, Cost = cost,
+                                            Reader = stat.Level, Token = token,
+                                            Score = score,
+                                        }
+                                    else
+                                        cashBlocked += 1
+                                    end
+                                end
+                            else
+                                capped += 1
+                            end
+                        end
                     end
                 end
             end
         end
     end
-    if bestKey then
-        local old = MineConfig.GetHolderLevel((mg.Holders or {})[bestKey])
-        if sendConfirmed("MineUpgradeCharacter", function(_, fresh)
-            local holder = fresh and (fresh.Holders or {})[bestKey]
-            return holder and MineConfig.GetHolderLevel(holder) > old
-        end, 2.4, bestKey) then
-            if state.rescueActive then state.rescueCharacterBuys += 1 end
-            return "Upgraded holder " .. tostring(bestKey)
+    if #options == 0 then
+        state.minerStatsStatus = string.format("%d assigned miners; %d copied; %d capped stats; %d waiting for cash/research",
+            assigned, copied, capped, cashBlocked)
+        return nil
+    end
+
+    -- In a research power emergency, spend on the most productive Damage
+    -- increase first. Otherwise, sort deterministically and cycle fairly
+    -- through ALL equipped miner/stat pairs on successive successful upgrades.
+    table.sort(options, function(a, b)
+        if rescue and a.Score ~= b.Score then return a.Score > b.Score end
+        return a.Token < b.Token
+    end)
+    local start = 1
+    if not rescue then
+        local lastToken = state.minerStatsLastToken or ""
+        for i, option in ipairs(options) do
+            if option.Token > lastToken then start = i; break end
         end
     end
+    for offset = 0, #options - 1 do
+        local selected = options[(start + offset - 1) % #options + 1]
+        local scope = "MineUpgradeCharacter:" .. tostring(selected.Key) .. ":" .. selected.Name
+        if (state.actionBlocks[scope] or 0) <= os.clock() then
+            -- The game UI always passes the stat kind; the previous Damage
+            -- upgrader omitted it. Explicit arguments match its button exactly.
+            state.minerStatsLastToken = selected.Token
+            local bought = sendConfirmed("MineUpgradeCharacter", function(_, fresh)
+                local holder = fresh and fresh.Holders and fresh.Holders[selected.Key]
+                if not holder or holder.CharName ~= selected.CharName then return false end
+                local checked, freshLevel = pcall(selected.Reader, holder)
+                return checked and (tonumber(freshLevel) or 0) > selected.Level
+            end, 2.4, selected.Key, selected.Name)
+            if bought then
+                state.minerStatUpgrades[selected.Name] = (state.minerStatUpgrades[selected.Name] or 0) + 1
+                if rescue and selected.Name == "Damage" then
+                    state.rescueCharacterBuys = (state.rescueCharacterBuys or 0) + 1
+                end
+                state.minerStatsStatus = string.format("Upgraded %s on %s (%s): %d -> %d",
+                    selected.Name, tostring(selected.Key), selected.CharName,
+                    selected.Level, selected.Level + 1)
+                state.lastSuccess = state.minerStatsStatus
+                return state.minerStatsStatus
+            end
+            state.minerStatsStatus = string.format("%s on %s not confirmed; trying other miners next",
+                selected.Name, tostring(selected.Key))
+            return nil
+        end
+    end
+    state.minerStatsStatus = "All available stat upgrades cooling down"
+    return nil
 end
 
 local function craftTick(data, mg)
@@ -2153,42 +2491,8 @@ local Advanced = (function()
         end
         return false
     end
-    local function speedUpgrade(data, mg)
-        if not config.AutoCrewSpeed or not ready("speedCheck", 13) then return false end
-        local bestKey, bestType, bestScore, bestLevel
-        for holderKey, holder in pairs(mg.Holders or {}) do
-            if type(holder) == "table" and type(holder.CharName) == "string" then
-                local item = Items.GetItemData(holder.CharName)
-                if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
-                    for _, kind in ipairs({"Speed", "MineSpeed"}) do
-                        local level = kind == "Speed" and safe(MineConfig.GetHolderSpeedLevel, holder)
-                            or safe(MineConfig.GetHolderMineSpeedLevel, holder)
-                        local cost = kind == "Speed" and safe(MineConfig.GetCharacterSpeedUpgradeCost, level, item)
-                            or safe(MineConfig.GetCharacterMineSpeedUpgradeCost, level, item)
-                        local maxLevel = kind == "Speed" and MineConfig.CharSpeedMaxLevel
-                            or MineConfig.CharMineSpeedMaxLevel
-                        if level and maxLevel and level < maxLevel and affordable(data, cost) then
-                            local benefit = kind == "MineSpeed" and 1.7 or 1.0
-                            local score = benefit / (1 + math.log10(math.max(1, cost)))
-                            if not bestScore or score > bestScore then
-                                bestScore, bestKey, bestType, bestLevel = score, holderKey, kind, level
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        if bestKey then
-            local old = bestLevel
-            return doClaim("MineUpgradeCharacter", function(_, fresh)
-                local h = fresh and (fresh.Holders or {})[bestKey]
-                local current = h and (bestType == "Speed" and safe(MineConfig.GetHolderSpeedLevel, h)
-                    or safe(MineConfig.GetHolderMineSpeedLevel, h))
-                return current and current > old
-            end, bestKey, bestType)
-        end
-        return false
-    end
+    -- Miner Damage, Speed and MineSpeed now share the fair, server-verified
+    -- characterLevelsTick planner. Do not run a second, competing buyer here.
     local function weatherTick()
         if not Weather or not ready("weatherScan", 12) then return end
         local list = safe(Weather.GetActive)
@@ -2220,44 +2524,44 @@ local Advanced = (function()
             if ok and outcome then return end
         end
     end
-    return {Tick = tick, SpeedUpgrade = speedUpgrade}
+    return {Tick = tick}
 end)()
 
 -- Throughput improvements based on native game mechanics. No new movement owner.
 local Accelerator = (function()
     local lastOwnSellAttempt = -100
     local lastPickEquip = -100
-    local function availablePickaxes(mg)
-        local owned = {}
+    local function equipBestOwnedPickaxe(mg)
+        if not config.AutoEquipOwnedPickaxes then return end
+        local now = os.clock()
+        if now - lastPickEquip < (state.rescueActive and 1.4 or 2.8) then return end
+        local spares = {}
         for name, count in pairs(mg.Pickaxes or {}) do
             if (tonumber(count) or 0) > 0 then
-                local def = MineConfig.GetPickaxeByName(name)
-                local _,_,unused = MineConfig.GetPickaxeStock(mg, name)
-                if def and (tonumber(unused) or 0) > 0 then
-                    table.insert(owned, {name=name, multiplier=tonumber(def.Multiplier) or 1})
+                local _, _, spare = MineConfig.GetPickaxeStock(mg, name)
+                local definition = MineConfig.GetPickaxeByName(name)
+                if definition and (tonumber(spare) or 0) > 0 then
+                    spares[#spares + 1] = {name = name, mult = tonumber(definition.Multiplier) or 1}
                 end
             end
         end
-        table.sort(owned,function(a,b) return a.multiplier > b.multiplier end)
-        return owned
-    end
-    local function equipBestOwnedPickaxe(mg)
-        if not config.AutoEquipOwnedPickaxes or os.clock()-lastPickEquip < (state.rescueActive and 1.0 or 4.5) then return end
-        local available = availablePickaxes(mg)
-        if #available==0 then return end
+        if #spares == 0 then return end
         local chosenKey, chosenName, chosenGain
         for holderKey, holder in pairs(mg.Holders or {}) do
-            if type(holder)=="table" and type(holder.CharName)=="string" then
-                local item=Items.GetItemData(holder.CharName)
-                if item and item.Type=="Character" and item.MineRole~="Hauler" then
-                    local current = MineConfig.GetHolderPickaxe(holder)
-                    local currentMult = tonumber(current and current.Multiplier) or 1
-                    for _,tool in ipairs(available) do
-                        if tool.multiplier>currentMult+0.001 then
-                            local base=tonumber(MineConfig.GetHolderBaseDamage(holder,item)) or 0
-                            local gain=base*(tool.multiplier-currentMult)
-                            if gain>0 and (not chosenGain or gain>chosenGain) then
-                                chosenGain,chosenKey,chosenName=gain,holderKey,tool.name
+            if type(holder) == "table" and type(holder.CharName) == "string" then
+                local item = Items.GetItemData(holder.CharName)
+                if item and item.Type == "Character" and item.MineRole ~= "Hauler" then
+                    local old = MineConfig.GetHolderPickaxe(holder)
+                    local oldMult = math.max(1, tonumber(old and old.Multiplier) or 1)
+                    local oldDamage = (tonumber(MineConfig.GetHolderDamage(holder, item)) or 0)
+                        * (tonumber(MineConfig.GetEnchantPowerMult(mg, holderKey)) or 1)
+                    for _, def in ipairs(spares) do
+                        if def.mult > oldMult * 1.001 then
+                            local gain = oldDamage * (def.mult / oldMult - 1)
+                            local scope = "MineEquipPickaxe:" .. tostring(holderKey) .. ":" .. def.name
+                            if gain > 0 and (state.actionBlocks[scope] or 0) <= now
+                                and (not chosenGain or gain > chosenGain) then
+                                chosenKey, chosenName, chosenGain = holderKey, def.name, gain
                             end
                         end
                     end
@@ -2265,16 +2569,19 @@ local Accelerator = (function()
             end
         end
         if not chosenKey then return end
-        lastPickEquip=os.clock()
-        local okay=sendConfirmed("MineEquipPickaxe",function(_,fresh)
-            local holder=fresh and fresh.Holders and fresh.Holders[chosenKey]
-            return holder and holder.Pickaxe==chosenName
-        end,2.0,chosenKey,chosenName)
+        lastPickEquip = now
+        local okay = sendConfirmed("MineEquipPickaxe", function(_, fresh)
+            local holder = fresh and fresh.Holders and fresh.Holders[chosenKey]
+            return holder and holder.Pickaxe == chosenName
+        end, 2.5, chosenKey, chosenName)
         if okay then
-
-            state.lastSuccess="Optimised owned pickaxe "..tostring(chosenName)
+            state.ownedPickaxeEquips = (state.ownedPickaxeEquips or 0) + 1
+            state.pickaxeStatus = string.format("Equipped %s (+%.3g team power)", chosenName, chosenGain)
+            state.lastSuccess = "Optimised owned pickaxe " .. tostring(chosenName)
+            state.lastPickaxe = -100
         end
     end
+
     local function ownedNativeAutoSell(data,mg)
         if not config.EnableOwnedAutoSell or not mg.TutorialDone or os.clock()-lastOwnSellAttempt < 2.5 then return end
         local ok,hasPass=pcall(MineConfig.PlayerHasPass,data,MineConfig.AutoSellPassLabel)
@@ -2346,9 +2653,9 @@ local function maintenance()
         -- No optional upgrade spends coins ahead of the gate. No movement waits.
         local researchOk, researchBought = pcall(researchTick, data, mg)
         if not researchOk then state.lastFailure = "Research planner: " .. tostring(researchBought) end
-        local routines = {skillTick, characterLevelsTick, buySlotOrTap, pickaxeTick, craftTick, Advanced.SpeedUpgrade}
+        local routines = {skillTick, characterLevelsTick, buySlotOrTap, pickaxeTick, craftTick}
         -- Rotate successful spend categories so cheap skills cannot starve
-        -- miner speed, miner levels, tap damage or extra normal slots.
+        -- all three miner stat upgrades, tap damage or extra normal slots.
         local start = (state.upgradeCursor % #routines) + 1
         for offset = 0, #routines - 1 do
             if researchOk and researchBought then break end
@@ -2399,17 +2706,62 @@ local function farmLoop()
         local capacity = tonumber(MineConfig.GetChestCapacityFor(mg, 0)) or 0
         local chestCount = totalChestCount(entries)
         local chestFull = config.UrgentFullChest and plot:GetAttribute("MineChestFull") == true
+        local goal = nil
+        if config.AutoCashoutProgression and config.AutoChest and config.AutoSellOre then
+            local planned, result = pcall(progressionCashoutPlan, data, mg, entries)
+            if planned then
+                goal = result
+            else
+                state.lastFailure = "Cashout planner: " .. tostring(result)
+            end
+        end
+        local urgentChest = goal and goal.NeedChest
+        if goal then
+            state.cashoutGoal = goal.Name
+            state.cashoutStatus = string.format("%s: %.3g / %.3g cash; ore %.3g bag + %.3g chest",
+                goal.Name, goal.Cash, goal.Cost, goal.BagWorth, goal.ChestWorth)
+        else
+            state.cashoutGoal = "None"
+            state.cashoutStatus = "Waiting for ore to fund required research or next zone"
+        end
         if config.AutoChest and chestCount > 0
-            and (chestFull or capacity <= 0 or chestCount / math.max(1, capacity) >= config.ChestPercent
+            and (urgentChest or chestFull or capacity <= 0
+                or chestCount / math.max(1, capacity) >= config.ChestPercent
                 or os.clock() - state.lastChest > 115) then
-            local ok, result = pcall(collectChest, plot, mg, epoch, true)
+            -- Urgent cashouts override the normal chest percentage/age.
+            local ok, result = pcall(collectChest, plot, mg, epoch, true, urgentChest)
             if not ok then state.lastFailure = "Chest: " .. tostring(result) end
             lastActionSucceeded = ok and result
+            if lastActionSucceeded and urgentChest then
+                state.cashoutChestCollections += 1
+                state.cashoutStatus = "Collected chest for " .. goal.Name .. "; selling ore"
+                -- Chest and inventory replication is confirmed before selling;
+                -- collectChest uses the game's Take All, which also keeps miners.
+                task.wait(0.12)
+                local _, refreshedMine = getMine()
+                local soldOk, sold = pcall(sellOre, refreshedMine or mg, epoch, true)
+                if not soldOk then
+                    state.lastFailure = "Progression sale: " .. tostring(sold)
+                elseif sold then
+                    state.cashoutSells += 1
+                    state.lastCashoutAt = os.clock()
+                    state.cashoutStatus = "Sold chest ore for " .. goal.Name
+                end
+            end
         end
-        if not lastActionSucceeded and config.AutoSellOre then
-            local ok, result = pcall(sellOre, mg, epoch, false)
+        if not lastActionSucceeded and config.AutoSellOre and not (urgentChest and chestCount > 0) then
+            -- Wait for the chest if its ore is REQUIRED for this purchase;
+            -- selling a smaller partial bag first wastes a seller journey.
+            -- If bagged ore ALREADY pays for the goal, visit the seller first.
+            local urgentSell = goal and not goal.NeedChest
+            local ok, result = pcall(sellOre, mg, epoch, urgentSell == true)
             if not ok then state.lastFailure = "Seller: " .. tostring(result) end
             lastActionSucceeded = ok and result
+            if lastActionSucceeded and urgentSell then
+                state.cashoutSells += 1
+                state.lastCashoutAt = os.clock()
+                state.cashoutStatus = "Sold carried ore for " .. goal.Name
+            end
         end
         if not lastActionSucceeded then
             -- Return by the game's own travel action ONLY for meaningful distances.
@@ -2486,8 +2838,35 @@ table.insert(state.connections, Player.CharacterAdded:Connect(function()
     cancelWalk()
     state.plot = nil
     task.wait(1)
-
 end))
+
+-- Optional Roblox inactivity prevention: only reacts to LocalPlayer.Idled.
+-- Works independently of the farm Master toggle and is automatically
+-- disconnected by API.Unload. Does not modify character position or stats.
+local idleConnected, idleError = pcall(function()
+    local connection = Player.Idled:Connect(function()
+        if not state.alive or not config.AntiAFK then return end
+        if os.clock() - state.lastAntiAfk < 45 then return end
+        state.lastAntiAfk = os.clock()
+        local ok, why = pcall(function()
+            local camera = Workspace.CurrentCamera
+            if not camera then error("Camera unavailable") end
+            local virtualUser = SERVICE("VirtualUser")
+            virtualUser:CaptureController()
+            virtualUser:Button2Down(Vector2.new(0, 0), camera.CFrame)
+            task.wait(0.10)
+            virtualUser:Button2Up(Vector2.new(0, 0), camera.CFrame)
+        end)
+        if ok then
+            state.antiAfkTriggers += 1
+            state.antiAfkStatus = "Idle input sent successfully"
+        else
+            state.antiAfkStatus = "VirtualUser unavailable: " .. tostring(why)
+        end
+    end)
+    table.insert(state.connections, connection)
+end)
+if not idleConnected then state.antiAfkStatus = "Idle listener unavailable: " .. tostring(idleError) end
 
 local okUI, PuckUI = pcall(function()
     if type(loadstring) ~= "function" then error("Executor does not implement loadstring") end
@@ -2504,8 +2883,8 @@ end
 local window = PuckUI:CreateWindow({
     Name = "PuckAFK | My Anime Mine",
     LoadingTitle = "My Anime Mine",
-    LoadingSubtitle = "One-click smart farming",
-    Width = 560, Height = 520,
+    LoadingSubtitle = "Easy automatic progression",
+    Width = 612, Height = 540,
     ConfigId = "MyAnimeMine",
     Configs = {DefaultProfile = "default", AutoSave = true, AutoLoad = true},
 })
@@ -2516,11 +2895,123 @@ if window.Config and window.Config.Available and window.Config.AutoLoad == false
     config.Master = false
 end
 
+-- Move old profile keys to the corresponding new tab before UI controls autoload.
+-- Existing profile files are not edited in place; the next save writes new keys.
+local migratedTabForKey = {
+    ['AccurateMotherlode'] = 'Advanced',
+    ['AdaptiveNodeDensity'] = 'Advanced',
+    ['AdaptiveRockChoice'] = 'Advanced',
+    ['AntiAFK'] = 'Settings',
+    ['AutoBuffGift'] = 'Rewards',
+    ['AutoBuyZones'] = 'Upgrades',
+    ['AutoCashoutProgression'] = 'Home',
+    ['AutoCharacterLevels'] = 'Upgrades',
+    ['AutoChest'] = 'Home',
+    ['AutoCompleteResearch'] = 'Upgrades',
+    ['AutoCrafting'] = 'Advanced',
+    ['AutoCrewSpeed'] = 'Upgrades',
+    ['AutoEnchants'] = 'Rewards',
+    ['AutoEquipOwnedPickaxes'] = 'Upgrades',
+    ['AutoEventClaims'] = 'Rewards',
+    ['AutoFocusSpecial'] = 'Advanced',
+    ['AutoGear'] = 'Rewards',
+    ['AutoIndex'] = 'Rewards',
+    ['AutoJumpObstacles'] = 'Advanced',
+    ['AutoMailbox'] = 'Rewards',
+    ['AutoMinerMineSpeed'] = 'Upgrades',
+    ['AutoPerformance'] = 'Settings',
+    ['AutoPickaxes'] = 'Upgrades',
+    ['AutoPotions'] = 'Rewards',
+    ['AutoQuests'] = 'Rewards',
+    ['AutoSellOre'] = 'Home',
+    ['AutoSkills'] = 'Upgrades',
+    ['AutoSlots'] = 'Upgrades',
+    ['AutoSpin'] = 'Rewards',
+    ['AutoSummon'] = 'Rewards',
+    ['AutoTapUpgrades'] = 'Upgrades',
+    ['AutoTrialClaims'] = 'Rewards',
+    ['AutoTrialRuns'] = 'Advanced',
+    ['AutoZone'] = 'Upgrades',
+    ['BudgetPercent'] = 'Advanced',
+    ['CancelDeadRockWalk'] = 'Advanced',
+    ['ChestPercent'] = 'Advanced',
+    ['ChosenZone'] = 'Advanced',
+    ['ColossusMaxSeconds'] = 'Advanced',
+    ['CornerRecovery'] = 'Advanced',
+    ['EfficientTrips'] = 'Advanced',
+    ['EnableOwnedAutoSell'] = 'Rewards',
+    ['EquipBest'] = 'Upgrades',
+    ['FastLocalMining'] = 'Advanced',
+    ['FasterScheduling'] = 'Advanced',
+    ['FocusSpecialRocks'] = 'Advanced',
+    ['KeepSummonScrolls'] = 'Advanced',
+    ['Master'] = 'Home',
+    ['MaxTapsPerRock'] = 'Advanced',
+    ['MaxTargetTravel'] = 'Advanced',
+    ['MaxWalkRetries'] = 'Advanced',
+    ['MinSellValue'] = 'Advanced',
+    ['Mine'] = 'Home',
+    ['MineMode'] = 'Advanced',
+    ['NativeTravel'] = 'Advanced',
+    ['PickaxeMinTeamGain'] = 'Advanced',
+    ['PickaxeMode'] = 'Upgrades',
+    ['PickaxeReservePercent'] = 'Advanced',
+    ['PickaxeSpendPercent'] = 'Advanced',
+    ['PotionMode'] = 'Advanced',
+    ['PotionReserve'] = 'Advanced',
+    ['PowerAwareResearch'] = 'Advanced',
+    ['PowerGateRescue'] = 'Upgrades',
+    ['PowerRescueKeepCash'] = 'Advanced',
+    ['PowerRescueLevels'] = 'Advanced',
+    ['PowerRescueMaxPurchase'] = 'Advanced',
+    ['PowerRescuePickaxes'] = 'Advanced',
+    ['ResearchCashBoost'] = 'Advanced',
+    ['RockLocalityBoost'] = 'Advanced',
+    ['SmartResearchPriority'] = 'Advanced',
+    ['SmartUpgradeSavings'] = 'Advanced',
+    ['StuckTimeout'] = 'Advanced',
+    ['TapInterval'] = 'Advanced',
+    ['TrialMinPowerRatio'] = 'Advanced',
+    ['UpgradeReserve'] = 'Advanced',
+    ['UrgentFullChest'] = 'Advanced',
+    ['WeatherAware'] = 'Rewards',
+    ['ZoneBuyMode'] = 'Advanced',
+    ['ZoneMaxRockSeconds'] = 'Advanced',
+    ['ZoneMode'] = 'Advanced',
+    ['ZoneSaveAt'] = 'Advanced',
+    ['ZoneSaveForNext'] = 'Upgrades',
+}
+local function migrateProfileValues(values)
+    if type(values) ~= "table" then return values end
+    local migrated = table.clone(values)
+    local originalTabs = {Home = true, Farm = true, Progress = true,
+        Extras = true, Settings = true}
+    for oldKey, value in pairs(values) do
+        local oldTab, key = tostring(oldKey):match("^([%w_]+)%.([%w_]+)$")
+        if oldTab and originalTabs[oldTab] and key and migratedTabForKey[key] then
+            local newKey = migratedTabForKey[key] .. "." .. key
+            if migrated[newKey] == nil then migrated[newKey] = value end
+        end
+    end
+    return migrated
+end
+if window.Config and window.Config.AutoLoad and type(window.Config.LoadedValues) == "table" then
+    window.Config.LoadedValues = migrateProfileValues(window.Config.LoadedValues)
+end
+local previousConfigApplier = window._ApplyConfigValues
+if type(previousConfigApplier) == "function" then
+    function window:_ApplyConfigValues(values)
+        return previousConfigApplier(self, migrateProfileValues(values))
+    end
+end
+
+-- Beginner-first interface: five clearly named tabs plus PuckUI's native Configs.
+-- Advanced settings stay available, but are not mixed into everyday controls.
 local homeTab = window:CreateTab("Home")
-local farmTab = window:CreateTab("Farm")
-local progressTab = window:CreateTab("Progress")
-local extrasTab = window:CreateTab("Extras")
-local settingsTab = window:CreateTab("Settings") -- PuckUI injects keybind, scale and Configs tab
+local upgradeTab = window:CreateTab("Upgrades")
+local rewardTab = window:CreateTab("Rewards")
+local settingsTab = window:CreateTab("Settings") -- PuckUI adds Interface controls
+local advancedTab = window:CreateTab("Advanced") -- opt-in fine tuning
 local controlSetters = {}
 local controlCount = {}
 
@@ -2583,11 +3074,11 @@ local function percent(v, toUI)
 end
 local function notify(title, message)
     pcall(function()
-        PuckUI:Notify({Title=title, Content=message, Duration=3})
+        PuckUI:Notify({Title = title, Content = message, Duration = 3})
     end)
 end
 local function setOption(key, value)
-    if key == "Master" then return end -- Never start through profile/preset changes.
+    if key == "Master" then return end -- No preset or profile unexpectedly starts the farm.
     local apply = controlSetters[key]
     if apply then
         local ok, why = pcall(apply, value)
@@ -2599,155 +3090,283 @@ end
 local function applyPreset(name, changes)
     for key, value in pairs(changes) do setOption(key, value) end
     state.lastSuccess = "Preset " .. name
-    notify("Preset applied", name .. "; farming start/pause was not changed")
+    notify("Settings applied", name .. " (farm start/pause unchanged)")
 end
 
-homeTab:CreateSection("Quick start")
+-- One-click fix for older profiles containing disabled default settings.
+-- Purchases of Robux items never become enabled; crafting, trial running and
+-- experimental crew focus remain opt-in. Potions/scrolls consume spare inventory.
+local recommended = {
+    Mine = true, AutoChest = true, AutoSellOre = true,
+    AutoCashoutProgression = true, EquipBest = true,
+    AutoSkills = true, AutoCompleteResearch = true,
+    AutoTapUpgrades = true, AutoSlots = true,
+    AutoCharacterLevels = true, AutoCrewSpeed = true,
+    AutoMinerMineSpeed = true,
+    AutoPickaxes = true, AutoEquipOwnedPickaxes = true,
+    EnableOwnedAutoSell = true, AutoZone = true, AutoBuyZones = true,
+    ZoneSaveForNext = true, AutoSpin = true, AutoQuests = true,
+    AutoIndex = true, AutoMailbox = true, AutoBuffGift = true,
+    AutoEventClaims = true, AutoTrialClaims = true,
+    AutoGear = true, AutoEnchants = true,
+    AutoPotions = true, AutoSummon = true, AntiAFK = true,
+    NativeTravel = true, EfficientTrips = true, UrgentFullChest = true,
+    FastLocalMining = true, SmartUpgradeSavings = true,
+    FasterScheduling = true, SmartResearchPriority = true,
+    PowerGateRescue = true, PowerRescuePickaxes = true,
+    PowerRescueLevels = true, PowerAwareResearch = true,
+    AutoJumpObstacles = true, CornerRecovery = true,
+    CancelDeadRockWalk = true, AdaptiveRockChoice = true,
+    ResearchCashBoost = true, AdaptiveNodeDensity = true,
+    FocusSpecialRocks = true, WeatherAware = true,
+    AccurateMotherlode = true,
+    AutoTrialRuns = false, AutoFocusSpecial = false,
+    AutoCrafting = false, AutoPerformance = false,
+    PickaxeMode = "Smart", MineMode = "Balanced",
+    ZoneMode = "Highest unlocked", ZoneBuyMode = "Affordable",
+}
+
+-- HOME: less clutter, one important switch, recommended setup and live status.
+homeTab:CreateSection("Start Farming")
 homeTab:CreateParagraph({
-    Title = "Smart Autofarm",
-    Content = "Enable the switch below. Mining, selling, crew, research and zone unlocking work together automatically. Adjust details only if you want to.",
+    Title = "Automatic Mining & Progression",
+    Content = "Turn on the switch below to mine, collect, sell, upgrade miners, buy better pickaxes, complete research and unlock zones.",
+    Height = 68,
 })
 toggle(homeTab, "Start / Pause Autofarm", "Master")
-homeTab:CreateSection("Everyday options")
+homeTab:CreateLabel("Starts paused each time; your settings are saved.")
+homeTab:CreateSection("Everyday Automation")
 toggle(homeTab, "Mine Rocks", "Mine")
 toggle(homeTab, "Collect Ore Chests", "AutoChest")
-toggle(homeTab, "Sell Ore Automatically", "AutoSellOre")
-toggle(homeTab, "Unlock New Zones", "AutoBuyZones")
-homeTab:CreateSection("Quick presets")
-homeTab:CreateButton({Name = "Balanced (recommended)", Callback = function()
-    applyPreset("Balanced", {
-        MineMode="Balanced", RockLocalityBoost=1.6, ChestPercent=0.72,
-        EfficientTrips=true, MaxTargetTravel=75, MaxWalkRetries=4,
-        FastLocalMining=true, FasterScheduling=true,
-        AutoJumpObstacles=true, CornerRecovery=true,
+toggle(homeTab, "Sell Ores Automatically", "AutoSellOre")
+toggle(homeTab, "Cash Out for Research / Zones", "AutoCashoutProgression")
+homeTab:CreateSection("Recommended Setup")
+homeTab:CreateButton({Name = "Enable All Recommended Features", Callback = function()
+    applyPreset("Recommended automatic progression", recommended)
+end})
+homeTab:CreateButton({Name = "Faster Mining", Callback = function()
+    applyPreset("Faster mining", {
+        MineMode = "Fast", FastLocalMining = true, AdaptiveRockChoice = true,
+        RockLocalityBoost = 1.9, MaxTargetTravel = 55,
+        ChestPercent = 0.85, FasterScheduling = true,
     })
 end})
-homeTab:CreateButton({Name = "Fast Farming", Callback = function()
-    applyPreset("Fast Farming", {
-        MineMode="Fast", RockLocalityBoost=1.9, ChestPercent=0.85,
-        EfficientTrips=true, MaxTargetTravel=55, MaxWalkRetries=3,
-        FastLocalMining=true, FasterScheduling=true,
-        AutoJumpObstacles=true, CornerRecovery=true,
+homeTab:CreateButton({Name = "Save More Money", Callback = function()
+    applyPreset("Save more money", {
+        MineMode = "Balanced", PickaxeMode = "Conservative",
+        PickaxeSpendPercent = 0.25, PickaxeReservePercent = 0.45,
+        BudgetPercent = 0.12, UpgradeReserve = 0.35,
+        ZoneSaveForNext = true, EfficientTrips = true,
     })
 end})
-homeTab:CreateButton({Name = "Careful / Fewer Trips", Callback = function()
-    applyPreset("Careful", {
-        MineMode="Balanced", RockLocalityBoost=1.5, ChestPercent=0.90,
-        EfficientTrips=true, MaxTargetTravel=45, MaxWalkRetries=4,
-        FastLocalMining=true, FasterScheduling=false,
-        AutoJumpObstacles=true, CornerRecovery=true,
-    })
-end})
-homeTab:CreateLabel("Profiles: save or load your setup in the Configs tab.")
-
-farmTab:CreateSection("Mining")
-dropdown(farmTab, "Rock selection", "MineMode", {"Balanced", "Fast", "Value", "Rare loot"})
-toggle(farmTab, "Prioritise Nearby Rocks", "FastLocalMining")
-toggle(farmTab, "Adaptive Rock Targeting", "AdaptiveRockChoice")
-toggle(farmTab, "Prioritise Valuable Special Rocks", "FocusSpecialRocks")
-toggle(farmTab, "Research-Adjusted Motherlode", "AccurateMotherlode")
-slider(farmTab, "Nearby Target Preference (%)", "RockLocalityBoost", 100, 200, 10, percent)
-slider(farmTab, "Max Rock Hits", "MaxTapsPerRock", 8, 100, 1)
-slider(farmTab, "Tap Interval (game-limited)", "TapInterval", 1.2, 3.0, 0.1)
-farmTab:CreateSection("Selling & Storage")
-toggle(farmTab, "Avoid Unnecessary Seller Trips", "EfficientTrips")
-toggle(farmTab, "Empty Full Chest Immediately", "UrgentFullChest")
-toggle(farmTab, "Use Owned Auto Sell Pass", "EnableOwnedAutoSell")
-slider(farmTab, "Collect Chest At (%)", "ChestPercent", 20, 95, 5, percent)
-slider(farmTab, "Minimum Ore Sale Value", "MinSellValue", 0, 100000, 1000)
-farmTab:CreateSection("Character Movement")
-toggle(farmTab, "Jump Small Obstacles", "AutoJumpObstacles")
-toggle(farmTab, "Reroute Around Walls", "CornerRecovery")
-toggle(farmTab, "Stop Moving When Rock Breaks", "CancelDeadRockWalk")
-toggle(farmTab, "Use In-Game Hub Travel", "NativeTravel")
-slider(farmTab, "Max Target Distance (studs)", "MaxTargetTravel", 25, 140, 5)
-slider(farmTab, "Route Retries", "MaxWalkRetries", 1, 5, 1)
-slider(farmTab, "Stuck Detection (seconds)", "StuckTimeout", 0.7, 2, 0.05)
-farmTab:CreateLabel("Walking uses MoveTo, pathfinding and jumping. No tweening.")
-
-progressTab:CreateSection("Automatic progression")
-toggle(progressTab, "Equip Best Crew", "EquipBest")
-toggle(progressTab, "Finish Required Research (100%)", "AutoCompleteResearch")
-toggle(progressTab, "Prioritise Affordable Research", "SmartResearchPriority")
-toggle(progressTab, "Buy Useful Optional Research", "AutoSkills")
-toggle(progressTab, "Automatically Select Best Zone", "AutoZone")
-toggle(progressTab, "Save Cash for Zone Unlocks", "ZoneSaveForNext")
-toggle(progressTab, "Upgrade Equipped Characters", "AutoCharacterLevels")
-toggle(progressTab, "Upgrade Crew Speed", "AutoCrewSpeed")
-toggle(progressTab, "Equip Owned Pickaxes", "AutoEquipOwnedPickaxes")
-progressTab:CreateSection("Blocked by team power?")
-toggle(progressTab, "Respect Research Power Requirements", "PowerAwareResearch")
-toggle(progressTab, "Improve Power to Unlock Research", "PowerGateRescue")
-toggle(progressTab, "Buy Better Pickaxes for Miners", "PowerRescuePickaxes")
-toggle(progressTab, "Level Miners for More Power", "PowerRescueLevels")
-progressTab:CreateLabel("Research comes first, then the next zone unlock.")
-progressTab:CreateSection("Progression preferences")
-dropdown(progressTab, "Zone Unlock Condition", "ZoneBuyMode", {"Affordable", "Power ready"})
-dropdown(progressTab, "Which Zone to Farm", "ZoneMode", {"Highest unlocked", "Selected zone"})
-slider(progressTab, "Selected Zone", "ChosenZone", 1, 12, 1)
-slider(progressTab, "Upgrade Spend Limit (%)", "BudgetPercent", 5, 80, 5, percent)
-slider(progressTab, "Keep Cash Reserve (%)", "UpgradeReserve", 0, 60, 5, percent)
-
-extrasTab:CreateSection("Free Rewards")
-toggle(extrasTab, "Daily Spins", "AutoSpin")
-toggle(extrasTab, "Daily Quests When Available", "AutoQuests")
-toggle(extrasTab, "Claim Index Rewards", "AutoIndex")
-toggle(extrasTab, "Claim Mailbox Rewards", "AutoMailbox")
-toggle(extrasTab, "Claim Free Buff Rewards", "AutoBuffGift")
-toggle(extrasTab, "Claim Event Rewards", "AutoEventClaims")
-toggle(extrasTab, "Claim Trial Milestones", "AutoTrialClaims")
-extrasTab:CreateSection("Inventory & Specials")
-toggle(extrasTab, "Equip Owned Gear", "AutoGear")
-toggle(extrasTab, "Equip Owned Enchants", "AutoEnchants")
-toggle(extrasTab, "React to Weather", "WeatherAware")
-toggle(extrasTab, "Use Spare Potions", "AutoPotions")
-toggle(extrasTab, "Use Spare Summon Scrolls", "AutoSummon")
-toggle(extrasTab, "Run Eligible Trials", "AutoTrialRuns")
-toggle(extrasTab, "Send Crew to Special Rocks (experimental)", "AutoFocusSpecial")
-extrasTab:CreateLabel("Trials and crew-focus are optional. No Robux spending.")
-extrasTab:CreateSection("Expert controls")
-toggle(extrasTab, "Optional Cash Pickaxe Purchases", "AutoPickaxes")
-toggle(extrasTab, "Auto Expand Crew Slots", "AutoSlots")
-toggle(extrasTab, "Upgrade Tap Damage", "AutoTapUpgrades")
-toggle(extrasTab, "Crafting When Enabled", "AutoCrafting")
-toggle(extrasTab, "Buy Useful Density While Strong", "AdaptiveNodeDensity")
-toggle(extrasTab, "Auto-Save Small Upgrades", "SmartUpgradeSavings")
-toggle(extrasTab, "Mine Cash During Research Wait", "ResearchCashBoost")
-toggle(extrasTab, "Fast Responsive Scheduling", "FasterScheduling")
-slider(extrasTab, "Save For Zone At (%)", "ZoneSaveAt", 10, 95, 5, percent)
-slider(extrasTab, "Max Zone Rock Time (seconds)", "ZoneMaxRockSeconds", 15, 180, 5)
-slider(extrasTab, "Power: Max Purchase (%)", "PowerRescueMaxPurchase", 5, 45, 5, percent)
-slider(extrasTab, "Power: Keep Money (%)", "PowerRescueKeepCash", 15, 80, 5, percent)
-slider(extrasTab, "Colossus Time Limit (seconds)", "ColossusMaxSeconds", 15, 180, 5)
-slider(extrasTab, "Keep Summon Scrolls", "KeepSummonScrolls", 0, 30, 1)
-dropdown(extrasTab, "Potion Strategy", "PotionMode", {"Balanced", "Cash", "Rare finds", "Power"})
-slider(extrasTab, "Keep Potions", "PotionReserve", 0, 15, 1)
-slider(extrasTab, "Trial Power Margin", "TrialMinPowerRatio", 1, 10, 0.5)
-
-settingsTab:CreateSection("Farming preferences")
-toggle(settingsTab, "Fewer Heavy Effects", "AutoPerformance")
-settingsTab:CreateSection("Presets & profiles")
-settingsTab:CreateParagraph({
-    Title = "Saving your setup",
-    Content = "Open Configs to create, save, load or delete named profiles. Auto Save and Auto Load are controlled there. The autofarm always starts paused for safety.",
+homeTab:CreateLabel("Presets never start farming automatically.")
+homeTab:CreateSection("Live Farm Status")
+local homeFarmStatus = homeTab:CreateParagraph({
+    Title = "Paused", Content = "Ready when you are. Turn on Start / Pause Autofarm.", Height = 58,
 })
+local homeProgressStatus = homeTab:CreateParagraph({
+    Title = "Zone & Research", Content = "Waiting for player progression data.", Height = 58,
+})
+local homePurchaseStatus = homeTab:CreateParagraph({
+    Title = "Purchases & Miner Upgrades", Content = "Waiting for automated progression.", Height = 58,
+})
+homeTab:CreateLabel("Detailed controls: Upgrades, Rewards, Advanced.")
+
+-- UPGRADES: straightforward defaults for the recurring money and power loop.
+upgradeTab:CreateSection("Research & Zones")
+toggle(upgradeTab, "Complete Required Research", "AutoCompleteResearch")
+toggle(upgradeTab, "Unlock Next Zone", "AutoBuyZones")
+toggle(upgradeTab, "Mine Best Unlocked Zone", "AutoZone")
+toggle(upgradeTab, "Save Money for Next Zone", "ZoneSaveForNext")
+toggle(upgradeTab, "Buy Useful Extra Research", "AutoSkills")
+upgradeTab:CreateLabel("Research and zones always take spending priority.")
+upgradeTab:CreateSection("Upgrade All Assigned Miners")
+toggle(upgradeTab, "Upgrade Miner Damage", "AutoCharacterLevels")
+toggle(upgradeTab, "Upgrade Miner Speed", "AutoCrewSpeed")
+toggle(upgradeTab, "Upgrade Miner Mining Speed", "AutoMinerMineSpeed")
+toggle(upgradeTab, "Equip Best Crew", "EquipBest")
+upgradeTab:CreateLabel("Rotates fairly through your selected mining crew.")
+upgradeTab:CreateSection("Pickaxes")
+toggle(upgradeTab, "Auto Buy Better Pickaxes", "AutoPickaxes")
+toggle(upgradeTab, "Equip Best Owned Pickaxes", "AutoEquipOwnedPickaxes")
+dropdown(upgradeTab, "Pickaxe Buying", "PickaxeMode", {"Smart", "Conservative", "Aggressive"})
+upgradeTab:CreateLabel("Stock, zone locks and cash reserves are respected.")
+upgradeTab:CreateSection("Other Helpful Upgrades")
+toggle(upgradeTab, "Buy More Miner Slots", "AutoSlots")
+toggle(upgradeTab, "Upgrade Click Damage", "AutoTapUpgrades")
+toggle(upgradeTab, "Overcome Research Power Gates", "PowerGateRescue")
+
+-- REWARDS: mostly ON from the start; optional inventory-consuming tasks are labelled.
+rewardTab:CreateSection("Claim Free Rewards")
+toggle(rewardTab, "Free Daily Spins", "AutoSpin")
+toggle(rewardTab, "Daily Quests", "AutoQuests")
+toggle(rewardTab, "Index Rewards", "AutoIndex")
+toggle(rewardTab, "Mailbox Rewards", "AutoMailbox")
+toggle(rewardTab, "Free Buff Gifts", "AutoBuffGift")
+toggle(rewardTab, "Event Rewards", "AutoEventClaims")
+toggle(rewardTab, "Trial Milestone Rewards", "AutoTrialClaims")
+rewardTab:CreateSection("Owned Equipment")
+toggle(rewardTab, "Equip Best Gear", "AutoGear")
+toggle(rewardTab, "Equip Owned Enchants", "AutoEnchants")
+toggle(rewardTab, "Use Owned Auto Sell Pass", "EnableOwnedAutoSell")
+rewardTab:CreateLabel("Does not purchase any gamepasses or Robux items.")
+rewardTab:CreateSection("Useful Extras")
+toggle(rewardTab, "Use Spare Potions", "AutoPotions")
+toggle(rewardTab, "Use Spare Summon Scrolls", "AutoSummon")
+toggle(rewardTab, "React to Weather", "WeatherAware")
+rewardTab:CreateLabel("Potions and scrolls use your inventory, with reserves.")
+
+-- SETTINGS: anti-afk, performance, profile guidance and essential safety controls.
+settingsTab:CreateSection("AFK & Performance")
+toggle(settingsTab, "Prevent AFK Disconnect", "AntiAFK")
+toggle(settingsTab, "Reduce Heavy Visual Effects", "AutoPerformance")
+settingsTab:CreateLabel("Anti-AFK also works while farming is paused.")
+settingsTab:CreateSection("Saving Your Settings")
+settingsTab:CreateParagraph({
+    Title = "Profiles Save Automatically",
+    Content = "Use the Configs tab for save, load, new profiles and Auto Save / Auto Load. Older saved profiles can override these new recommended defaults.",
+    Height = 68,
+})
+settingsTab:CreateLabel("Use Home > Enable All Recommended Features to refresh an old profile.")
+settingsTab:CreateSection("Stop or Reset")
 local resetArmedUntil = 0
-settingsTab:CreateButton({Name = "Restore Default Options (press twice)", Callback = function()
+settingsTab:CreateButton({Name = "Restore Defaults (press twice)", Callback = function()
     if os.clock() > resetArmedUntil then
         resetArmedUntil = os.clock() + 10
-        notify("Confirm reset", "Press Restore Default Options again within 10 seconds")
+        notify("Confirm reset", "Press again within 10 seconds. Farming state is unchanged.")
         return
     end
     resetArmedUntil = 0
     for key, value in pairs(defaults) do
         if key ~= "Master" then setOption(key, value) end
     end
-    notify("Options restored", "Default options restored. Autofarm start/pause unchanged.")
+    notify("Defaults restored", "Recommended defaults restored. Start/pause unchanged.")
 end})
 settingsTab:CreateButton({Name = "Stop and Unload Script", Callback = API.Unload})
-settingsTab:CreateLabel("UI size, layout and show/hide key are above.")
+settingsTab:CreateLabel("The Interface section above controls UI size and hide key.")
 
--- Home, Farm, Progress, Extras and Settings only. PuckUI manages named Configs.
+-- ADVANCED: granular tuning only for users who want to customise the automation.
+advancedTab:CreateSection("Mining Strategy")
+dropdown(advancedTab, "Rock Choice", "MineMode", {"Balanced", "Fast", "Value", "Rare loot"})
+toggle(advancedTab, "Prioritise Nearby Rocks", "FastLocalMining")
+toggle(advancedTab, "Adaptive Target Choice", "AdaptiveRockChoice")
+toggle(advancedTab, "Prioritise Special Rocks", "FocusSpecialRocks")
+toggle(advancedTab, "Research-Adjusted Motherlodes", "AccurateMotherlode")
+slider(advancedTab, "Nearby Rock Preference (%)", "RockLocalityBoost", 100, 200, 10, percent)
+slider(advancedTab, "Maximum Hits per Rock", "MaxTapsPerRock", 8, 100, 1)
+slider(advancedTab, "Click Interval (game-limited)", "TapInterval", 1.2, 3.0, 0.1)
+slider(advancedTab, "Colossus Time Limit (sec)", "ColossusMaxSeconds", 15, 180, 5)
+advancedTab:CreateSection("Chest & Selling")
+toggle(advancedTab, "Avoid Unnecessary Seller Trips", "EfficientTrips")
+toggle(advancedTab, "Empty a Full Chest Immediately", "UrgentFullChest")
+slider(advancedTab, "Collect Chest When Full (%)", "ChestPercent", 20, 95, 5, percent)
+slider(advancedTab, "Minimum Ore Sale Value", "MinSellValue", 0, 100000, 1000)
+advancedTab:CreateSection("Movement & Recovery")
+toggle(advancedTab, "Jump Small Obstacles", "AutoJumpObstacles")
+toggle(advancedTab, "Reroute Around Walls", "CornerRecovery")
+toggle(advancedTab, "Stop Moving When Rock Breaks", "CancelDeadRockWalk")
+toggle(advancedTab, "Use In-Game Hub Travel", "NativeTravel")
+slider(advancedTab, "Maximum Rock Travel Distance", "MaxTargetTravel", 25, 140, 5)
+slider(advancedTab, "Route Retry Limit", "MaxWalkRetries", 1, 5, 1)
+slider(advancedTab, "Stuck Detection (sec)", "StuckTimeout", 0.7, 2, 0.05)
+advancedTab:CreateLabel("Only MoveTo, native teleport and pathfinding; no tween.")
+advancedTab:CreateSection("Pickaxe Spending")
+slider(advancedTab, "Pickaxe Max Spend (%)", "PickaxeSpendPercent", 10, 90, 5, percent)
+slider(advancedTab, "Pickaxe Money Reserve (%)", "PickaxeReservePercent", 0, 80, 5, percent)
+slider(advancedTab, "Minimum Team Power Gain (%)", "PickaxeMinTeamGain", 0, 20, 1, percent)
+advancedTab:CreateSection("Zone & Research Priorities")
+toggle(advancedTab, "Prioritise Affordable Research", "SmartResearchPriority")
+toggle(advancedTab, "Respect Research Power Requirements", "PowerAwareResearch")
+toggle(advancedTab, "Buy Pickaxes to Unblock Research", "PowerRescuePickaxes")
+toggle(advancedTab, "Level Miners to Unblock Research", "PowerRescueLevels")
+toggle(advancedTab, "Improve Mining During Cash Wait", "ResearchCashBoost")
+toggle(advancedTab, "Buy Useful Node Density", "AdaptiveNodeDensity")
+toggle(advancedTab, "Smart Small-Upgrade Savings", "SmartUpgradeSavings")
+dropdown(advancedTab, "Zone Unlock Condition", "ZoneBuyMode", {"Affordable", "Power ready"})
+dropdown(advancedTab, "Zone Farming Selection", "ZoneMode", {"Highest unlocked", "Selected zone"})
+slider(advancedTab, "Chosen Zone", "ChosenZone", 1, 12, 1)
+slider(advancedTab, "Overall Upgrade Spend (%)", "BudgetPercent", 5, 80, 5, percent)
+slider(advancedTab, "Overall Cash Reserve (%)", "UpgradeReserve", 0, 60, 5, percent)
+slider(advancedTab, "Save For Zone At (%)", "ZoneSaveAt", 10, 95, 5, percent)
+slider(advancedTab, "Power Rescue: Max Spend (%)", "PowerRescueMaxPurchase", 5, 45, 5, percent)
+slider(advancedTab, "Power Rescue: Cash Kept (%)", "PowerRescueKeepCash", 15, 80, 5, percent)
+slider(advancedTab, "Max Zone Rock Time (sec)", "ZoneMaxRockSeconds", 15, 180, 5)
+advancedTab:CreateSection("Potions, Scrolls & Trials")
+dropdown(advancedTab, "Potion Preference", "PotionMode", {"Balanced", "Cash", "Rare finds", "Power"})
+slider(advancedTab, "Keep These Potions", "PotionReserve", 0, 15, 1)
+slider(advancedTab, "Keep These Summon Scrolls", "KeepSummonScrolls", 0, 30, 1)
+slider(advancedTab, "Trial Power Safety Margin", "TrialMinPowerRatio", 1, 10, 0.5)
+toggle(advancedTab, "Run Trials (optional)", "AutoTrialRuns")
+advancedTab:CreateSection("Experimental & Technical")
+toggle(advancedTab, "Automatically Craft (optional)", "AutoCrafting")
+toggle(advancedTab, "Experimental Crew Focus", "AutoFocusSpecial")
+toggle(advancedTab, "Fast Scheduling", "FasterScheduling")
+advancedTab:CreateLabel("Experimental systems remain OFF by default.")
+
+-- Keep a compact status display, without the high-frequency old diagnostics UI.
+local function shortText(value, limit)
+    local message = tostring(value or "")
+    limit = limit or 130
+    if #message > limit then return message:sub(1, limit - 3) .. "..." end
+    return message
+end
+local function shortCash(value)
+    local n = math.max(0, tonumber(value) or 0)
+    local labels = {"", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"}
+    local step = 1
+    while n >= 1000 and step < #labels do
+        n /= 1000
+        step += 1
+    end
+    if n >= 1000 then return string.format("%.2e", n * 1000 ^ (step - 1)) end
+    if n >= 100 then return string.format("%.0f%s", n, labels[step]) end
+    return string.format("%.1f%s", n, labels[step])
+end
+-- Updating only on changes reduces redraws while mining runs.
+task.spawn(function()
+    local previousFarm, previousProgress, previousPurchase
+    while state.alive do
+        local data, mg = getMine()
+        local farmTitle = config.Master and "Farming Running" or "Farming Paused"
+        local farmText = config.Master
+            and ("Activity: " .. shortText(state.target or "Choosing rock", 94))
+            or "Ready. Use Start / Pause Autofarm above to begin."
+        if config.Master and (not data or not mg) then
+            farmText = "Waiting for mine data from the game."
+        end
+        local farmStamp = farmTitle .. ":" .. farmText
+        if farmStamp ~= previousFarm then
+            pcall(function() homeFarmStatus:Set({Title = farmTitle, Content = farmText}) end)
+            previousFarm = farmStamp
+        end
+        local progressText = "Waiting for mine data."
+        if mg then
+            local nextZone, nextCost = nextZoneFromSave(mg)
+            local gate, done, needed, completed = zoneResearchStatus(mg, nextZone)
+            if nextZone then
+                local howFar = needed > 0 and math.floor(done / needed * 100) or (completed and 100 or 0)
+                local milestone = completed and ("Unlock " .. nextZone .. ": $" .. shortCash(nextCost))
+                    or ("Research " .. tostring(gate or "?") .. " " .. tostring(howFar) .. "%")
+                progressText = milestone .. " | Money $" .. shortCash(data and data.Money)
+            else
+                progressText = "All available zones unlocked | Money $" .. shortCash(data and data.Money)
+            end
+        end
+        if progressText ~= previousProgress then
+            pcall(function() homeProgressStatus:Set({Title = "Zone & Research", Content = progressText}) end)
+            previousProgress = progressText
+        end
+        local purchaseText = shortText(state.pickaxeStatus or "Monitoring shop", 62)
+            .. "\n" .. shortText(state.minerStatsStatus or "Monitoring assigned miners", 65)
+        if purchaseText ~= previousPurchase then
+            pcall(function() homePurchaseStatus:Set({Title = "Pickaxes & Miner Levels", Content = purchaseText}) end)
+            previousPurchase = purchaseText
+        end
+        task.wait(2.5)
+    end
+end)
+
+-- Simplified Home, Upgrades, Rewards, Settings and Advanced tabs; PuckUI owns Configs.
 -- All launched tasks are tied to the lifetime of this API object.
 task.spawn(function()
     while state.alive do

@@ -18,7 +18,11 @@ local HttpService = SERVICE("HttpService")
 local Player = Players.LocalPlayer
 
 -- Cleanly retire an earlier execution without leaving parallel movement loops.
-local env = getgenv and getgenv() or _G
+local env = _G
+if type(getgenv) == "function" then
+    local ok, shared = pcall(getgenv)
+    if ok and type(shared) == "table" then env = shared end
+end
 if type(env.PuckAFK_MyAnimeMine) == "table" and type(env.PuckAFK_MyAnimeMine.Unload) == "function" then
     pcall(env.PuckAFK_MyAnimeMine.Unload)
     task.wait(0.15)

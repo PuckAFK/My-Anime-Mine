@@ -204,6 +204,28 @@ local function readSettingsFile(path)
 end
 local oldSettings = readSettingsFile(CFG_PATH)
 if importSettings(oldSettings) then compatStore.loadedFrom = "legacy v1" end
+-- PuckUI may be unable to open its native profiles when makefolder/isfile is
+-- missing, even though readfile can still read an existing profile.
+local nativeMeta = readSettingsFile("PuckAFK/Configs/MyAnimeMine/_meta.json")
+if not nativeMeta or nativeMeta.AutoLoad ~= false then
+    local name = nativeMeta and nativeMeta.Selected or "default"
+    name = tostring(name):gsub("[^%w%-%._]", "_"):sub(1, 80)
+    if name == "" then name = "default" end
+    local nativeValues = readSettingsFile("PuckAFK/Configs/MyAnimeMine/" .. name .. ".json")
+    if type(nativeValues) == "table" then
+        local converted = {}
+        for sourceKey, value in pairs(nativeValues) do
+            local key = tostring(sourceKey):match("^[%w_]+%.([%w_]+)$")
+                or tostring(sourceKey)
+            if defaults[key] ~= nil and key ~= "Master" then
+                converted[key] = value
+            end
+        end
+        if importSettings(converted) then
+            compatStore.loadedFrom = "existing PuckUI profile"
+        end
+    end
+end
 local backedUp = readSettingsFile(COMPAT_PATH)
 if not backedUp then backedUp = readSettingsFile(COMPAT_PATH .. ".bak") end
 if importSettings(backedUp) then compatStore.loadedFrom = "portable disk backup" end
@@ -222,8 +244,9 @@ local function saveCompatSettings(force)
     local values = snapshotSettings()
     -- Memory is available even when the executor cannot write a file.
     env[SESSION_KEY] = values
-    if not force and not settingsChanged(values, compatStore.lastSaved) then
-        return compatStore.lastWriteOK
+    if not force and compatStore.lastWriteOK
+        and not settingsChanged(values, compatStore.lastSaved) then
+        return true
     end
     compatStore.lastSaved = values
     compatStore.lastAttempt = os.clock()
@@ -3615,11 +3638,18 @@ settingsTab:CreateButton({Name = "Reload Portable Backup", Callback = function()
     updateStoreStatus()
 end})
 local importJSON = ""
-settingsTab:CreateInput({Name = "Import JSON", CurrentValue = "",
+local importControl = settingsTab:CreateInput({Name = "Import JSON", CurrentValue = "",
     PlaceholderText = "Paste exported config JSON", NoConfig = true,
     Callback = function(value) importJSON = tostring(value or "") end})
 settingsTab:CreateButton({Name = "Apply Imported JSON", Callback = function()
-    local ok, decoded = pcall(function() return HttpService:JSONDecode(importJSON) end)
+    local liveText = importJSON
+    if importControl and importControl.Get then
+        local okRead, current = pcall(function() return importControl:Get() end)
+        if okRead and type(current) == "string" and current ~= "" then
+            liveText = current
+        end
+    end
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(liveText) end)
     local values = ok and type(decoded) == "table"
         and (type(decoded.Values) == "table" and decoded.Values or decoded) or nil
     if not values then
@@ -3801,8 +3831,11 @@ task.spawn(function()
     while state.alive do
         if configSaveAllowed(API.Window) then
             local live = snapshotSettings()
-            if settingsChanged(live, compatStore.lastSaved)
-                and os.clock() - compatStore.lastAttempt >= 2.0 then
+            local retrying = compatStore.read and compatStore.write
+                and not compatStore.lastWriteOK
+            local cooldown = retrying and 15.0 or 2.0
+            if (settingsChanged(live, compatStore.lastSaved) or retrying)
+                and os.clock() - compatStore.lastAttempt >= cooldown then
                 pcall(saveCompatSettings, false)
             end
         end

@@ -1,4 +1,5 @@
--- PuckAFK My Anime Mine - COMPLETE SMART AUTOFARM - 2026-10-12
+-- PuckAFK My Anime Mine - COMPLETE SMART AUTOFARM - v2.5 (2026-10-13)
+-- Executor compatibility: verified flat-file config backup, session fallback, JSON import/export
 -- Standalone main script based on the supplied original source and game dump.
 -- Integrated stock-aware smart pickaxe buying and equipped-miner optimization.
 -- v2.1: immediate chest-to-seller cash-out when ore funds required research or a zone unlock.
@@ -120,25 +121,144 @@ local defaults = {
     ChosenZone = 1,
 }
 local config = table.clone(defaults)
-local function settingsSafe()
-    return type(isfile) == "function" and type(readfile) == "function" and type(writefile) == "function"
+-- v2.5 executor-safe backup. PuckUI retains full named profile controls where
+-- its filesystem APIs work; a flat, portable file covers partial file APIs.
+-- Executors without persistent file APIs keep session settings only.
+local COMPAT_PATH = "PuckAFK_MyAnimeMine_Config_v2.json"
+local SESSION_KEY = "__PUCKAFK_MINE_CONFIG_SESSION_V2"
+local compatStore = {
+    read = type(readfile) == "function" and readfile or nil,
+    write = type(writefile) == "function" and writefile or nil,
+    lastError = nil, lastSaved = nil, lastAttempt = -100,
+    loadedFrom = "defaults", lastWriteOK = false,
+}
+local numberLimits = {
+    MinerKeepBestSpare = {0, 10}, MinerSellStrength = {0.10, 1},
+    ZoneSaveAt = {0.10, 0.95}, TapInterval = {1.2, 3},
+    StuckTimeout = {0.70, 2}, ChosenZone = {1, 12},
+    MaxWalkRetries = {1, 5}, MaxTapsPerRock = {8, 100},
+    MaxTargetTravel = {25, 140}, ColossusMaxSeconds = {15, 180},
+    ZoneMaxRockSeconds = {15, 180}, MinSellValue = {0, 100000},
+    ChestPercent = {0.20, 0.95}, BudgetPercent = {0.05, 0.80},
+    UpgradeReserve = {0, 0.60}, RockLocalityBoost = {1, 2},
+    PickaxeSpendPercent = {0.10, 0.90},
+    PickaxeReservePercent = {0, 0.80},
+    PickaxeMinTeamGain = {0, 0.20},
+    PowerRescueMaxPurchase = {0.05, 0.45},
+    PowerRescueKeepCash = {0.15, 0.80},
+    PotionReserve = {0, 15}, KeepSummonScrolls = {0, 30},
+    TrialMinPowerRatio = {1, 10},
+}
+local choices = {
+    MineMode = {"Balanced", "Fast", "Value", "Rare loot"},
+    PickaxeMode = {"Smart", "Conservative", "Aggressive"},
+    ZoneBuyMode = {"Affordable", "Power ready"},
+    ZoneMode = {"Highest unlocked", "Selected zone"},
+    PotionMode = {"Balanced", "Cash", "Rare finds", "Power"},
+}
+local function validSetting(key, value)
+    local default = defaults[key]
+    if default == nil or key == "Master" or type(value) ~= type(default) then
+        return false
+    end
+    if type(value) == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then return false end
+        local range = numberLimits[key]
+        return not range or (value >= range[1] and value <= range[2])
+    end
+    local allowed = choices[key]
+    if allowed then return table.find(allowed, value) ~= nil end
+    return true
 end
-local function loadSettings()
-    if not settingsSafe() then return end
-    local ok, val = pcall(function()
-        if isfile(CFG_PATH) then return HttpService:JSONDecode(readfile(CFG_PATH)) end
-    end)
-    if ok and type(val) == "table" then
-        for key, default in pairs(defaults) do
-            if type(val[key]) == type(default) then config[key] = val[key] end
+local function importSettings(values)
+    if type(values) ~= "table" then return false end
+    local found = false
+    for key in pairs(defaults) do
+        local value = values[key]
+        if validSetting(key, value) then
+            config[key] = value
+            found = true
         end
     end
-    -- Never unexpectedly resume auto-walking on an executor restart.
     config.Master = false
+    return found
 end
--- Backward-compatibility: import v1.x settings if present, without changing
--- the old file. Named profiles are now exclusively written by PuckUI Configs.
-loadSettings()
+local function snapshotSettings()
+    local values = {}
+    for key in pairs(defaults) do
+        if key ~= "Master" and validSetting(key, config[key]) then
+            values[key] = config[key]
+        end
+    end
+    return values
+end
+local function readSettingsFile(path)
+    if not compatStore.read then return nil end
+    local ok, raw = pcall(compatStore.read, path)
+    if not ok or type(raw) ~= "string" or raw == "" then return nil end
+    local decoded, parsed = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not decoded or type(parsed) ~= "table" then return nil end
+    return type(parsed.Values) == "table" and parsed.Values or parsed
+end
+local oldSettings = readSettingsFile(CFG_PATH)
+if importSettings(oldSettings) then compatStore.loadedFrom = "legacy v1" end
+local backedUp = readSettingsFile(COMPAT_PATH)
+if not backedUp then backedUp = readSettingsFile(COMPAT_PATH .. ".bak") end
+if importSettings(backedUp) then compatStore.loadedFrom = "portable disk backup" end
+if type(env[SESSION_KEY]) == "table" and importSettings(env[SESSION_KEY]) then
+    compatStore.loadedFrom = "executor session"
+end
+config.Master = false
+local function settingsChanged(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return true end
+    for key in pairs(defaults) do
+        if key ~= "Master" and a[key] ~= b[key] then return true end
+    end
+    return false
+end
+local function saveCompatSettings(force)
+    local values = snapshotSettings()
+    -- Memory is available even when the executor cannot write a file.
+    env[SESSION_KEY] = values
+    if not force and not settingsChanged(values, compatStore.lastSaved) then
+        return compatStore.lastWriteOK
+    end
+    compatStore.lastSaved = values
+    compatStore.lastAttempt = os.clock()
+    if not compatStore.write or not compatStore.read then
+        compatStore.lastWriteOK = false
+        compatStore.lastError = "No persistent readfile/writefile support (session only)"
+        return false
+    end
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode({Version = 2, Values = values})
+    end)
+    if not ok or type(encoded) ~= "string" then
+        compatStore.lastWriteOK = false
+        compatStore.lastError = "JSON encoding failed"
+        return false
+    end
+    -- Keep a known-good recovery copy before replacing the portable file.
+    local oldOk, old = pcall(compatStore.read, COMPAT_PATH)
+    if oldOk and type(old) == "string" and old ~= "" and old ~= encoded then
+        pcall(compatStore.write, COMPAT_PATH .. ".bak", old)
+    end
+    local success, reason = pcall(compatStore.write, COMPAT_PATH, encoded)
+    if success then
+        local verify, actual = pcall(compatStore.read, COMPAT_PATH)
+        success = verify and actual == encoded
+        if not success then reason = "Write could not be read back" end
+    end
+    compatStore.lastWriteOK = success
+    compatStore.lastError = success and nil or tostring(reason)
+    return success
+end
+local function configSaveAllowed(window)
+    local uiConfig = window and window.Config
+    return not uiConfig or uiConfig.AutoSave ~= false
+end
 
 local state = {
     alive = true, walkEpoch = 0, walking = false,
@@ -2956,6 +3076,7 @@ function API.Unload()
     if API.Window then
         -- Flush unsaved UI changes before the window is destroyed. Respect the
         -- native Auto Save switch (manual profiles are not overwritten).
+        if configSaveAllowed(API.Window) then pcall(saveCompatSettings, true) end
         pcall(function()
             local native = API.Window.Config
             if native and native.Available and native.AutoSave
@@ -2966,7 +3087,7 @@ function API.Unload()
         pcall(function() API.Window:Destroy() end)
     end
     for _, connection in ipairs(state.connections) do pcall(function() connection:Disconnect() end) end
-    -- Native PuckUI Configs manages profiles. Preserve the old v1 settings file for migration.
+    -- PuckUI manages full profiles; the flat compat file backs up settings.
     if env.PuckAFK_MyAnimeMine == API then env.PuckAFK_MyAnimeMine = nil end
 
 end
@@ -2988,6 +3109,8 @@ function API.Stop()
 end
 API.Config = config
 API.State = state
+API.SaveConfig = function() return saveCompatSettings(true) end
+API.ConfigCompatibility = compatStore
 env.PuckAFK_MyAnimeMine = API
 
 table.insert(state.connections, Player.CharacterAdded:Connect(function()
@@ -3024,31 +3147,88 @@ local idleConnected, idleError = pcall(function()
 end)
 if not idleConnected then state.antiAfkStatus = "Idle listener unavailable: " .. tostring(idleError) end
 
+-- Prefer canonical PuckUI. Try common HTTP APIs if an executor's HttpGet is
+-- unavailable, and reuse a valid preloaded copy when one is supplied.
+local function fetchUISource(url)
+    local ok, result = pcall(function() return game:HttpGet(url) end)
+    if ok and type(result) == "string" and #result > 100 then return result end
+    local requests = {}
+    if type(request) == "function" then table.insert(requests, request) end
+    if type(http_request) == "function" then table.insert(requests, http_request) end
+    if type(syn) == "table" and type(syn.request) == "function" then
+        table.insert(requests, syn.request)
+    end
+    if type(http) == "table" and type(http.request) == "function" then
+        table.insert(requests, http.request)
+    end
+    for _, fetch in ipairs(requests) do
+        local worked, response = pcall(fetch, {Url = url, Method = "GET"})
+        if worked and type(response) == "table" then
+            local body = response.Body or response.body
+            local status = tonumber(response.StatusCode or response.Status or 200) or 0
+            if status >= 200 and status < 300 and type(body) == "string"
+                and #body > 100 then return body end
+        end
+    end
+    local direct, body = pcall(function() return HttpService:GetAsync(url) end)
+    if direct and type(body) == "string" and #body > 100 then return body end
+    return nil
+end
 local okUI, PuckUI = pcall(function()
-    if type(loadstring) ~= "function" then error("Executor does not implement loadstring") end
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua"))()
+    for _, name in ipairs({"PuckUI", "PuckAFK_PuckUI"}) do
+        local cached = env[name]
+        if type(cached) == "table" and type(cached.CreateWindow) == "function" then
+            return cached
+        end
+    end
+    if type(loadstring) ~= "function" then
+        error("Executor is missing loadstring; PuckUI cannot be compiled")
+    end
+    local urls = {
+        "https://raw.githubusercontent.com/PuckAFK/Puck-Loader/refs/heads/main/ui/PuckUI.lua",
+        "https://cdn.jsdelivr.net/gh/PuckAFK/Puck-Loader@main/ui/PuckUI.lua",
+    }
+    for _, url in ipairs(urls) do
+        local source = fetchUISource(url)
+        if source then
+            local compiled, loader = pcall(loadstring, source)
+            if compiled and type(loader) == "function" then
+                local executed, library = pcall(loader)
+                if executed and type(library) == "table"
+                    and type(library.CreateWindow) == "function" then
+                    return library
+                end
+            end
+        end
+    end
+    error("Unable to fetch or run PuckUI with this executor's HTTP APIs")
 end)
-if not okUI or type(PuckUI) ~= "table" then
+if not okUI or type(PuckUI) ~= "table"
+    or type(PuckUI.CreateWindow) ~= "function" then
     API.Unload()
-    error("[PuckAFK Mine] Could not load PuckUI: " .. tostring(PuckUI))
+    error("[PuckAFK Mine] UI compatibility check failed: " .. tostring(PuckUI))
 end
 
 -- A concise home screen, dedicated advanced controls and native PuckUI profiles.
--- ConfigId remains stable between script versions. Existing v1.9 JSON is
--- imported only as the initial fallback when no PuckUI profile is available.
-local window = PuckUI:CreateWindow({
+-- ConfigId stays stable, with portable disk/session backup for partial APIs.
+local windowOK, window = pcall(function() return PuckUI:CreateWindow({
     Name = "PuckAFK | My Anime Mine",
     LoadingTitle = "My Anime Mine",
     LoadingSubtitle = "Easy automatic progression",
     Width = 612, Height = 540,
     ConfigId = "MyAnimeMine",
     Configs = {DefaultProfile = "default", AutoSave = true, AutoLoad = true},
-})
+}) end)
+if not windowOK or type(window) ~= "table" then
+    API.Unload()
+    error("[PuckAFK Mine] UI window could not open: " .. tostring(window))
+end
 API.Window = window
 -- If the user disabled profile auto-loading, truly start with defaults.
 if window.Config and window.Config.Available and window.Config.AutoLoad == false then
     for key, value in pairs(defaults) do config[key] = value end
     config.Master = false
+    compatStore.loadedFrom = "autoload disabled"
 end
 
 -- Move old profile keys to the corresponding new tab before UI controls autoload.
@@ -3238,12 +3418,13 @@ local function notify(title, message)
 end
 local function setOption(key, value)
     if key == "Master" then return end -- No preset or profile unexpectedly starts the farm.
+    if not validSetting(key, value) then return end
+    -- Store immediately: PuckUI callbacks run via task.spawn and may be delayed.
+    config[key] = value
     local apply = controlSetters[key]
     if apply then
         local ok, why = pcall(apply, value)
         if not ok then state.lastFailure = "Option " .. key .. ": " .. tostring(why) end
-    elseif defaults[key] ~= nil and type(value) == type(defaults[key]) then
-        config[key] = value
     end
 end
 local function applyPreset(name, changes)
@@ -3389,6 +3570,87 @@ settingsTab:CreateParagraph({
     Height = 68,
 })
 settingsTab:CreateLabel("Use Home > Enable All Recommended Features to refresh an old profile.")
+settingsTab:CreateSection("Executor Config Backup")
+local storeStatus = settingsTab:CreateLabel("Checking persistent settings...")
+local function updateStoreStatus()
+    local native = window.Config and window.Config.Available
+    local disk = compatStore.read and compatStore.write
+    local message = native and "PuckUI profiles + portable backup"
+        or (disk and "Portable file backup (partial executor APIs)"
+        or "Session-only settings (no file persistence)")
+    if compatStore.lastError then message = message .. " | " .. tostring(compatStore.lastError) end
+    if storeStatus and storeStatus.Set then
+        pcall(function() storeStatus:Set(message) end)
+    end
+end
+settingsTab:CreateLabel("Portable file: " .. COMPAT_PATH)
+settingsTab:CreateLabel("Session-only means settings may be lost when the executor closes.")
+settingsTab:CreateButton({Name = "Save Config Now", Callback = function()
+    local saved = saveCompatSettings(true)
+    local native = window.Config
+    if native and native.Available and type(window._WriteConfig) == "function" then
+        pcall(function() window:_WriteConfig(native.Selected, false) end)
+    end
+    updateStoreStatus()
+    notify("Config", saved and "Saved and verified portable backup"
+        or "Session backup only: " .. tostring(compatStore.lastError))
+end})
+settingsTab:CreateButton({Name = "Reload Portable Backup", Callback = function()
+    local values = readSettingsFile(COMPAT_PATH)
+        or readSettingsFile(COMPAT_PATH .. ".bak")
+    if not values then
+        notify("Config", "No readable portable backup found.")
+        return
+    end
+    local count = 0
+    for key in pairs(defaults) do
+        if validSetting(key, values[key]) then
+            setOption(key, values[key])
+            count += 1
+        end
+    end
+    config.Master = false
+    if masterToggle then pcall(function() masterToggle:Set(false) end) end
+    notify("Config restored", tostring(count) .. " settings loaded (farm paused).")
+    updateStoreStatus()
+end})
+local importJSON = ""
+settingsTab:CreateInput({Name = "Import JSON", CurrentValue = "",
+    PlaceholderText = "Paste exported config JSON", NoConfig = true,
+    Callback = function(value) importJSON = tostring(value or "") end})
+settingsTab:CreateButton({Name = "Apply Imported JSON", Callback = function()
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(importJSON) end)
+    local values = ok and type(decoded) == "table"
+        and (type(decoded.Values) == "table" and decoded.Values or decoded) or nil
+    if not values then
+        notify("Config", "Invalid JSON. Paste an exported settings JSON object.")
+        return
+    end
+    local count = 0
+    for key in pairs(defaults) do
+        if validSetting(key, values[key]) then
+            setOption(key, values[key])
+            count += 1
+        end
+    end
+    API.Stop()
+    notify("Config imported", tostring(count) .. " settings applied (farm paused).")
+end})
+settingsTab:CreateButton({Name = "Export Config JSON", Callback = function()
+    local ok, json = pcall(function()
+        return HttpService:JSONEncode({Version = 2, Values = snapshotSettings()})
+    end)
+    if not ok then notify("Config", "Unable to encode settings.") return end
+    local copy = type(setclipboard) == "function" and setclipboard
+        or type(toclipboard) == "function" and toclipboard or nil
+    if copy then
+        local copied = pcall(copy, json)
+        if copied then notify("Config", "Settings JSON copied to clipboard.") return end
+    end
+    print("[PuckAFK Mine] CONFIG JSON: " .. json)
+    notify("Config", "No clipboard API. JSON printed to executor console.")
+end})
+updateStoreStatus()
 settingsTab:CreateSection("Stop or Reset")
 local resetArmedUntil = 0
 settingsTab:CreateButton({Name = "Restore Defaults (press twice)", Callback = function()
@@ -3528,6 +3790,23 @@ task.spawn(function()
             previousPurchase = purchaseText
         end
         task.wait(2.5)
+    end
+end)
+
+-- Portable backup watches actual config (not UI-only percent slider values).
+-- Native PuckUI profiles remain available on executors with full file APIs.
+task.spawn(function()
+    task.wait(1.8) -- allow PuckUI's deferred profile autoload to finish first
+    compatStore.lastSaved = nil
+    while state.alive do
+        if configSaveAllowed(API.Window) then
+            local live = snapshotSettings()
+            if settingsChanged(live, compatStore.lastSaved)
+                and os.clock() - compatStore.lastAttempt >= 2.0 then
+                pcall(saveCompatSettings, false)
+            end
+        end
+        task.wait(1.5)
     end
 end)
 
